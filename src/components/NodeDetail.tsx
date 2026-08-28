@@ -14,6 +14,7 @@ import {
   watts,
 } from '../lib/format';
 import { Badge, Button, Card, CoreGrid, StatTile, StatusDot } from './ui';
+import { ContainersPanel } from './ContainersPanel';
 import { Dial } from './viz/Dial';
 import { LineChart } from './viz/LineChart';
 import { Meter } from './viz/Meter';
@@ -25,9 +26,10 @@ interface Props {
   history?: History;
   onEdit: () => void;
   onPower: (action: 'shutdown' | 'reboot' | 'wake') => void;
+  onNotice: (message: string) => void;
 }
 
-export function NodeDetail({ node, config, history, onEdit, onPower }: Props) {
+export function NodeDetail({ node, config, history, onEdit, onPower, onNotice }: Props) {
   const gpu = node.gpus[0];
 
   if (!node.online) {
@@ -301,6 +303,8 @@ export function NodeDetail({ node, config, history, onEdit, onPower }: Props) {
           )}
         </Card>
       )}
+
+      <ContainersPanel node={node} onResult={onNotice} />
 
       <div className="grid gap-4 xl:grid-cols-2">
         {/* GPU processes */}

@@ -4,6 +4,7 @@ import { registry } from './registry.js';
 import { createRunner, runBatch } from './exec/index.js';
 import { SYSTEM_COMMANDS, parseSystem } from './collectors/system.js';
 import { GPU_COMMANDS, parseGpus, parseGpuProcesses } from './collectors/gpu.js';
+import { DOCKER_COMMANDS, parseContainers } from './collectors/docker.js';
 import { probeLlmEndpoints } from './collectors/llm.js';
 import { demoSnapshot } from './collectors/demo.js';
 import { specForNode } from './collectors/specs.js';
@@ -51,6 +52,9 @@ class NodeMonitor {
       spec: specForNode(node),
       gpus: [],
       gpuProcesses: [],
+      containers: [],
+      dockerAvailable: false,
+      dockerError: null,
       storage: [],
       network: [],
       thermal: [],
@@ -60,6 +64,11 @@ class NodeMonitor {
 
   start() {
     this.#scheduleNext(0);
+  }
+
+  /* Docker needs a moment to settle after start/stop before `docker ps` is accurate. */
+  pollSoon() {
+    this.#scheduleNext(400);
   }
 
   #scheduleNext(delay = config.pollIntervalMs) {
@@ -139,7 +148,7 @@ class NodeMonitor {
     this.runner ??= createRunner(node);
 
     const [sections, llmProbes] = await Promise.all([
-      runBatch(this.runner, { ...SYSTEM_COMMANDS, ...GPU_COMMANDS }),
+      runBatch(this.runner, { ...SYSTEM_COMMANDS, ...GPU_COMMANDS, ...DOCKER_COMMANDS }),
       probeLlmEndpoints(
         (node.llmPorts ?? []).map((p) => ({ host: node.host, port: p.port, label: p.label })),
       ),
@@ -148,6 +157,7 @@ class NodeMonitor {
     const system = parseSystem(sections);
     const isUnified = node.type === 'dgx-spark';
     const gpus = parseGpus(sections.gpu || '', { isUnified });
+    const docker = parseContainers(sections.docker || '');
 
     const now = Date.now();
     const elapsedSeconds = this.previous ? (now - this.previous.at) / 1000 : 0;
@@ -171,6 +181,9 @@ class NodeMonitor {
       },
       gpus,
       gpuProcesses: parseGpuProcesses(sections.gpuProcesses || ''),
+      containers: docker.containers,
+      dockerAvailable: docker.available,
+      dockerError: docker.error,
       thermal: system.thermal,
       storage: system.storage,
       network: this.#deriveNetwork(system, elapsedSeconds),
@@ -297,6 +310,11 @@ export class Monitor extends EventEmitter {
   /* Called after editing a node so the next poll uses the new credentials. */
   refresh(nodeId) {
     this.#monitors.get(nodeId)?.invalidateRunner();
+  }
+
+  /* Called after a write action so its effect appears without a full poll wait. */
+  refreshSoon(nodeId) {
+    this.#monitors.get(nodeId)?.pollSoon();
   }
 
   snapshot() {

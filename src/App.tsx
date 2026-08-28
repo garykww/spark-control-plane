@@ -184,6 +184,7 @@ export default function App() {
             history={history[active.nodeId]}
             onEdit={() => setDialog({ open: true, node: configById.get(active.nodeId) ?? null })}
             onPower={(action) => handlePower(active.nodeId, action)}
+            onNotice={setToast}
           />
         ) : null}
       </main>

@@ -7,6 +7,7 @@ import { createLocalRunner } from '../exec/local.js';
 import { getPassword } from '../secrets.js';
 import { probeLlmEndpoint } from '../collectors/llm.js';
 import { powerAction, wakeOnLan } from '../power.js';
+import { containerAction } from '../containers.js';
 import { DGX_SPARK_SPEC } from '../collectors/specs.js';
 
 export const api = express.Router();
@@ -127,6 +128,18 @@ api.post('/nodes/:id/power', route(async (req, res) => {
   }
 
   res.json(await powerAction(node, action));
+}));
+
+/*
+ * Start, stop or restart a container. The id is validated as hex before it
+ * reaches a command line, and only three fixed verbs are accepted.
+ */
+api.post('/nodes/:id/containers/:containerId/:action', route(async (req, res) => {
+  const node = requireNode(req);
+  const result = await containerAction(node, req.params.containerId, req.params.action);
+  /* Re-poll promptly so the UI reflects the new state without waiting a full tick. */
+  monitor.refreshSoon(req.params.id);
+  res.json(result);
 }));
 
 api.get('/snapshot', (req, res) => {

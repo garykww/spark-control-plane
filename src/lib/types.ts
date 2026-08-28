@@ -87,6 +87,18 @@ export interface LlmStatus {
   kvCacheUsage: number | null;
 }
 
+export interface Container {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+  status: string;
+  ports: string[];
+  createdAt: string;
+}
+
+export type ContainerAction = 'start' | 'stop' | 'restart';
+
 export interface SparkSpec {
   platform: string;
   soc: string;
@@ -132,6 +144,10 @@ export interface NodeSnapshot {
   };
   gpus: Gpu[];
   gpuProcesses: GpuProcess[];
+  containers: Container[];
+  /* False when Docker is absent or unreachable; dockerError says which. */
+  dockerAvailable: boolean;
+  dockerError: string | null;
   thermal: ThermalZone[];
   storage: Mount[];
   network: Interface[];

@@ -118,6 +118,37 @@ export function demoSnapshot(node, index = 0) {
         txRate: Math.max(0, scaled(seed + 7, 29, t, 1.1e7, 1.1e7, 0, 2.4e10)),
       },
     ],
+    containers: [
+      {
+        id: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+        name: 'vllm-llama70b',
+        image: 'vllm/vllm-openai:latest',
+        state: gpuUtil > 12 ? 'running' : 'exited',
+        status: gpuUtil > 12 ? 'Up 4 hours' : 'Exited (0) 6 minutes ago',
+        ports: ['8000->8000/tcp'],
+        createdAt: '2026-08-27 09:14:22 +0000 UTC',
+      },
+      {
+        id: 'b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1',
+        name: 'open-webui',
+        image: 'ghcr.io/open-webui/open-webui:main',
+        state: 'running',
+        status: 'Up 2 days',
+        ports: ['3000->8080/tcp'],
+        createdAt: '2026-08-25 18:02:10 +0000 UTC',
+      },
+      {
+        id: 'c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2',
+        name: 'jupyter',
+        image: 'nvcr.io/nvidia/pytorch:25.06-py3',
+        state: 'exited',
+        status: 'Exited (137) 3 hours ago',
+        ports: [],
+        createdAt: '2026-08-24 11:41:55 +0000 UTC',
+      },
+    ],
+    dockerAvailable: true,
+    dockerError: null,
     llm: [
       {
         id: 'demo:8000',

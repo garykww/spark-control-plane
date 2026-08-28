@@ -1,4 +1,4 @@
-import type { NodeConfig, TestResult } from './types';
+import type { ContainerAction, NodeConfig, TestResult } from './types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
@@ -52,4 +52,7 @@ export const api = {
 
   power: (id: string, action: 'shutdown' | 'reboot' | 'wake') =>
     request<{ ok: boolean }>(`/nodes/${id}/power`, { method: 'POST', body: JSON.stringify({ action }) }),
+
+  container: (nodeId: string, containerId: string, action: ContainerAction) =>
+    request<{ ok: boolean }>(`/nodes/${nodeId}/containers/${containerId}/${action}`, { method: 'POST' }),
 };

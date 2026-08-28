@@ -15,6 +15,7 @@ Each node gets a summary card on the Overview tab and a full page of its own:
 - **CPU** — aggregate and per-core utilisation, load averages
 - **Storage and network** — per-mount capacity, per-interface throughput
 - **Inference** — auto-detects vLLM, llama.cpp, SGLang, TGI, and Ollama, then tracks decode/prefill tokens per second, queue depth, and KV cache usage
+- **Containers** — every Docker container on the node, with start, stop, and restart buttons
 - **Thermals** — every thermal zone the kernel exposes
 
 Metrics stream over a WebSocket. History is kept on the server, so a browser refresh or a second viewer sees the same continuous chart rather than starting from an empty one.
@@ -105,13 +106,29 @@ A single failed poll doesn't mark a node offline. The last good snapshot is kept
 ```
 browser ──WebSocket /ws──> Monitor ──> NodeMonitor (one per node)
         ──REST /api/────> Registry           │
-                                             ├─ SSH or local runner ─> /proc, /sys, nvidia-smi
+                                             ├─ SSH or local runner ─> /proc, /sys, nvidia-smi, docker ps
                                              └─ HTTP probe ──────────> inference server /metrics
 ```
 
+## Containers
+
+The node detail page lists every container `docker ps -a` reports, running ones first, and gives you **Start**, **Stop**, and **Restart** on each row. Stopping asks for confirmation first.
+
+Nothing is optimistic: after an action the server re-polls within about half a second and the row updates from real `docker ps` output. A container that fails to start never looks like it started.
+
+The SSH user needs to reach the Docker daemon. If it can't, the panel says so rather than showing an empty list — usually it means adding the user to the `docker` group on that node:
+
+```bash
+sudo usermod -aG docker "$USER"   # then log out and back in
+```
+
+> **Warning**: control of the Docker daemon is effectively root on that machine. That's the same trust level the shutdown and reboot actions already assume, and the API is unauthenticated — another reason to keep the dashboard off untrusted networks.
+
+Per-container CPU and memory aren't collected. `docker stats` blocks for about a second per call, which would dominate a two-second poll loop.
+
 ## Power actions
 
-You can reboot or shut down a node from its detail page, and send a Wake-on-LAN packet if you've set its MAC address. These are the only commands the dashboard writes rather than reads — three fixed commands, no user-supplied shell text.
+You can reboot or shut down a node from its detail page, and send a Wake-on-LAN packet if you've set its MAC address. Along with the container actions above, these are the only commands the dashboard writes rather than reads — a fixed set of verbs, no user-supplied shell text.
 
 Shutdown and reboot need passwordless sudo for the SSH user. Without it, the dashboard tells you so rather than failing silently. On the target machine:
 
@@ -142,11 +159,12 @@ server/
   registry.js       node CRUD, validation, persistence
   secrets.js        AES-256-GCM password storage
   power.js          shutdown, reboot, Wake-on-LAN
-  collectors/       /proc + /sys, nvidia-smi, inference probes, demo data
+  containers.js     docker start / stop / restart
+  collectors/       /proc + /sys, nvidia-smi, docker ps, inference probes, demo data
   exec/             local and SSH command runners, batching
 src/
   App.tsx           shell, tabs, fleet summary
-  components/       node cards, detail panels, add/edit dialog
+  components/       node cards, detail panels, container list, add/edit dialog
   components/viz/   sparkline, line chart, dial, meter
   hooks/            WebSocket state, element sizing
 ```
