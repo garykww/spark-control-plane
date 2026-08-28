@@ -1,6 +1,7 @@
-import type { Gpu } from '../lib/types';
+import type { Gpu, GpuProcess } from '../lib/types';
 import { celsius, megahertz, percent, STATUS_VAR } from '../lib/format';
 import { Meter } from './viz/Meter';
+import { SmGrid } from './SmGrid';
 
 /*
  * SM-level status.
@@ -27,7 +28,7 @@ const ENGINE_LABELS: Record<string, string> = {
   ofa: 'Optical flow',
 };
 
-export function SmStatus({ gpu }: { gpu: Gpu }) {
+export function SmStatus({ gpu, processes }: { gpu: Gpu; processes: GpuProcess[] }) {
   const reasons = gpu.throttleReasons;
   const limiting = reasons?.filter((r) => r.severity !== 'info') ?? [];
   const serious = limiting.filter((r) => r.severity === 'serious');
@@ -130,6 +131,8 @@ export function SmStatus({ gpu }: { gpu: Gpu }) {
           )}
         </div>
       </div>
+
+      <SmGrid gpu={gpu} processes={processes} />
 
       {/* Fixed-function engines sit beside the SMs; hidden while all are idle. */}
       {gpu.enginesActive && (

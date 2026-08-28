@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseGpus, parseGpuProcesses, parseThrottleReasons } from './gpu.js';
+import { parseGpus, parseGpuProcesses, parseThrottleReasons, parsePmon, parseSmCount } from './gpu.js';
 
 const MIB = 1024 * 1024;
 
@@ -148,4 +148,41 @@ test('parseGpuProcesses sorts by memory and shortens the process path', () => {
   assert.equal(processes[0].name, 'ollama');
   assert.equal(processes[0].memory, 65536 * MIB);
   assert.equal(processes[1].name, 'python3');
+});
+
+test('parsePmon reads per-process SM share and skips comment rows', () => {
+  const rows = parsePmon(
+    [
+      '# gpu         pid   type     sm    mem    enc    dec    jpg    ofa    command',
+      '# Idx           #    C/G      %      %      %      %      %      %    name',
+      '    0       2374     G      -      -      -      -      -      -    Xorg',
+      '    0    2386039     C     95      0      -      -      -      -    python3',
+    ].join('\n'),
+  );
+
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[1], {
+    pid: 2386039,
+    type: 'compute',
+    sm: 95,
+    memory: 0,
+    name: 'python3',
+  });
+  /* A graphics process reporting "-" must stay null, not become 0. */
+  assert.equal(rows[0].sm, null);
+  assert.equal(rows[0].type, 'graphics');
+});
+
+test('parsePmon tolerates an empty or header-only table', () => {
+  assert.deepEqual(parsePmon(''), []);
+  assert.deepEqual(parsePmon('# gpu pid type sm'), []);
+});
+
+test('parseSmCount accepts a plausible count and rejects anything else', () => {
+  assert.equal(parseSmCount('48\n'), 48);
+  assert.equal(parseSmCount('132'), 132);
+
+  for (const bad of ['', '0', '-4', 'Traceback (most recent call last):', '99999', 'abc']) {
+    assert.equal(parseSmCount(bad), null, `expected "${bad}" to be rejected`);
+  }
 });

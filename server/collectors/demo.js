@@ -102,13 +102,14 @@ export function demoSnapshot(node, index = 0) {
               : [],
         engines: { encoder: 0, decoder: 0, jpeg: 0, ofa: 0 },
         enginesActive: false,
+        smCount: 48,
         isUnified: node.type === 'dgx-spark',
       },
     ],
     gpuProcesses: gpuUtil > 12
       ? [
-          { pid: 3241, name: 'vllm', command: '/usr/bin/python3 -m vllm.entrypoints.openai.api_server', memory: usedMemory * 0.78 },
-          { pid: 1877, name: 'ollama', command: '/usr/local/bin/ollama serve', memory: usedMemory * 0.14 },
+          { pid: 3241, name: 'vllm', command: '/usr/bin/python3 -m vllm.entrypoints.openai.api_server', memory: usedMemory * 0.78, sm: Math.round(gpuUtil * 0.82) },
+          { pid: 1877, name: 'ollama', command: '/usr/local/bin/ollama serve', memory: usedMemory * 0.14, sm: Math.round(gpuUtil * 0.18) },
         ]
       : [],
     thermal: [

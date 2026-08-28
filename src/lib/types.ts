@@ -60,6 +60,8 @@ export interface Gpu {
   throttleReasons: ThrottleReason[] | null;
   engines: GpuEngines;
   enginesActive: boolean;
+  /* Physical SM count from the CUDA driver API; null when the probe failed. */
+  smCount: number | null;
   isUnified: boolean;
 }
 
@@ -68,6 +70,8 @@ export interface GpuProcess {
   name: string;
   command: string;
   memory: number | null;
+  /* Share of SM time, from nvidia-smi pmon; null when it does not report one. */
+  sm: number | null;
 }
 
 export interface Mount {

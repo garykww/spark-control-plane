@@ -3,7 +3,14 @@ import { config } from './config.js';
 import { registry } from './registry.js';
 import { createRunner, runBatch } from './exec/index.js';
 import { SYSTEM_COMMANDS, parseSystem } from './collectors/system.js';
-import { GPU_COMMANDS, parseGpus, parseGpuProcesses } from './collectors/gpu.js';
+import {
+  GPU_COMMANDS,
+  SM_COUNT_COMMAND,
+  parseGpus,
+  parseGpuProcesses,
+  parsePmon,
+  parseSmCount,
+} from './collectors/gpu.js';
 import { DOCKER_COMMANDS, parseContainers } from './collectors/docker.js';
 import { probeLlmEndpoints } from './collectors/llm.js';
 import { demoSnapshot } from './collectors/demo.js';
@@ -39,6 +46,9 @@ class NodeMonitor {
     this.timer = null;
     this.stopped = false;
     this.polling = false;
+    /* Fixed hardware facts, probed once per connection rather than every poll. */
+    this.smCount = null;
+    this.smCountProbed = false;
   }
 
   #offlineSnapshot(node, error) {
@@ -88,6 +98,8 @@ class NodeMonitor {
   invalidateRunner() {
     const old = this.runner;
     this.runner = null;
+    /* Credentials or the host itself may have changed; re-probe the hardware. */
+    this.smCountProbed = false;
     old?.close?.();
   }
 
@@ -146,6 +158,7 @@ class NodeMonitor {
 
   async #collect(node) {
     this.runner ??= createRunner(node);
+    await this.#probeSmCount();
 
     const [sections, llmProbes] = await Promise.all([
       runBatch(this.runner, { ...SYSTEM_COMMANDS, ...GPU_COMMANDS, ...DOCKER_COMMANDS }),
@@ -157,6 +170,7 @@ class NodeMonitor {
     const system = parseSystem(sections);
     const isUnified = node.type === 'dgx-spark';
     const gpus = parseGpus(sections.gpu || '', { isUnified });
+    for (const gpu of gpus) gpu.smCount = this.smCount;
     const docker = parseContainers(sections.docker || '');
 
     const now = Date.now();
@@ -180,7 +194,7 @@ class NodeMonitor {
         percent: system.memory.total ? (system.memory.used / system.memory.total) * 100 : 0,
       },
       gpus,
-      gpuProcesses: parseGpuProcesses(sections.gpuProcesses || ''),
+      gpuProcesses: this.#mergeProcesses(sections),
       containers: docker.containers,
       dockerAvailable: docker.available,
       dockerError: docker.error,
@@ -199,6 +213,36 @@ class NodeMonitor {
     };
 
     return snapshot;
+  }
+
+  /*
+   * The SM count comes from the CUDA driver API, which needs a python3 that can
+   * load libcuda. It is optional: without it the UI simply omits the SM grid.
+   */
+  async #probeSmCount() {
+    if (this.smCountProbed) return;
+    this.smCountProbed = true;
+    try {
+      const { stdout } = await this.runner.run(SM_COUNT_COMMAND, 6000);
+      this.smCount = parseSmCount(stdout);
+    } catch {
+      this.smCount = null;
+    }
+  }
+
+  /*
+   * `--query-compute-apps` knows each process's full path and GPU memory;
+   * `pmon` knows its share of SM time. Join them on pid so one row carries both.
+   */
+  #mergeProcesses(sections) {
+    const processes = parseGpuProcesses(sections.gpuProcesses || '');
+    const smByPid = new Map(
+      parsePmon(sections.gpuPmon || '')
+        .filter((p) => p.sm !== null)
+        .map((p) => [p.pid, p.sm]),
+    );
+
+    return processes.map((process) => ({ ...process, sm: smByPid.get(process.pid) ?? null }));
   }
 
   /*

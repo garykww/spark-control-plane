@@ -39,7 +39,60 @@ export const GPU_COMMANDS = {
   gpu: `nvidia-smi --query-gpu=${GPU_FIELDS.join(',')} --format=csv,noheader,nounits`,
   gpuProcesses:
     'nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader,nounits',
+  /* Per-process SM share. nvidia-smi has no per-SM view, but it does report
+   * which processes are occupying SM time, which is what the grid divides up. */
+  gpuPmon: 'nvidia-smi pmon -c 1',
 };
+
+/*
+ * SM count is fixed hardware, so it is probed once per connection rather than
+ * every poll. NVML does not expose it; the CUDA driver API does, via
+ * CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT (16).
+ */
+export const SM_COUNT_COMMAND =
+  'python3 -c \'import ctypes;l=ctypes.CDLL("libcuda.so.1");l.cuInit(0);d=ctypes.c_int();l.cuDeviceGet(ctypes.byref(d),0);v=ctypes.c_int();l.cuDeviceGetAttribute(ctypes.byref(v),16,d);print(v.value)\'';
+
+export function parseSmCount(text) {
+  const value = Number.parseInt(String(text ?? '').trim(), 10);
+  /* Guard against a probe that printed a traceback or an implausible number. */
+  return Number.isInteger(value) && value > 0 && value <= 1024 ? value : null;
+}
+
+/*
+ * `nvidia-smi pmon -c 1` prints a fixed-width table with two leading comment
+ * rows. Columns: gpu, pid, type, sm, mem, enc, dec, jpg, ofa, command.
+ * Unsupported cells are "-" and must stay null rather than becoming 0.
+ */
+export function parsePmon(text) {
+  const processes = [];
+
+  for (const line of String(text ?? '').split('\n')) {
+    const row = line.trim();
+    if (!row || row.startsWith('#')) continue;
+
+    const cells = row.split(/\s+/);
+    if (cells.length < 4) continue;
+
+    const pid = Number.parseInt(cells[1], 10);
+    if (!Number.isInteger(pid)) continue;
+
+    const cell = (v) => {
+      const n = Number(v);
+      return v === '-' || !Number.isFinite(n) ? null : n;
+    };
+
+    processes.push({
+      pid,
+      /* C = compute, G = graphics; only compute work occupies SMs meaningfully. */
+      type: cells[2] === 'C' ? 'compute' : cells[2] === 'G' ? 'graphics' : cells[2],
+      sm: cell(cells[3]),
+      memory: cell(cells[4]),
+      name: cells[cells.length - 1],
+    });
+  }
+
+  return processes;
+}
 
 /*
  * NVML clock-event ("throttle") reasons. The driver reports them as a bitmask;

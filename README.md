@@ -113,12 +113,16 @@ browser ──WebSocket /ws──> Monitor ──> NodeMonitor (one per node)
 
 ## What "SM status" can and can't tell you
 
-There is **no per-SM breakdown available**. Neither NVML nor DCGM exposes individual streaming multiprocessors, so a grid of SMs like the per-core CPU one cannot be built — `utilization.gpu` is the fraction of time at least one kernel was resident, averaged across the whole GPU. Anything claiming otherwise is estimating.
+There is **no per-SM telemetry available**. Neither NVML nor DCGM exposes individual streaming multiprocessors — `utilization.gpu` is the fraction of time at least one kernel was resident, averaged across the whole GPU. Per-SM counters exist only under a profiler (Nsight Compute / CUPTI `sm__*` metrics), which attaches to a single process, serialises kernels and adds heavy overhead. That is a profiling workflow, not something a dashboard can poll.
+
+So the **SM occupancy grid is a proportional view, not a hardware map**. It draws one cell per physical SM (48 on a GB10, read from the CUDA driver API) and fills as many as the current utilisation accounts for, coloured by which process owns the SM time. A lit cell means "one SM's worth of the machine is busy with this process" — it does not mean that particular SM is running. The panel says so on screen, because a grid that looked like per-SM truth would be the misleading part.
 
 What *is* knowable is why the SMs are running at the speed they are, which is usually the question behind "what are my SMs doing". The panel shows:
 
 - **SM clock against its ceiling** — e.g. 2.38 GHz of a 3.00 GHz maximum, so you can see boost headroom at a glance
 - **SM activity** — the residency figure above, labelled for what it actually measures
+- **SM occupancy grid** — one cell per SM, filled proportionally and split by process (see above)
+- **Per-process SM share** — from `nvidia-smi pmon`, joined onto the process table by pid
 - **Clock limiters** — NVML's clock-event reasons decoded: power cap, thermal throttle, hardware slowdown, application clock limits. This is the part that explains a slow run.
 - **Thermal headroom** — degrees left before the driver starts cutting clocks
 - **Fixed-function engines** — encoder, decoder, JPEG and optical flow, shown only when one is actually working

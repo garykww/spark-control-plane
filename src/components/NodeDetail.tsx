@@ -94,7 +94,7 @@ export function NodeDetail({ node, config, history, onEdit, onPower, onNotice }:
           </div>
         </div>
 
-        {gpu && <SmStatus gpu={gpu} />}
+        {gpu && <SmStatus gpu={gpu} processes={node.gpuProcesses} />}
 
         {history && history.gpuUtilization.length > 1 && (
           <div className="mt-6 grid gap-6 md:grid-cols-2">
