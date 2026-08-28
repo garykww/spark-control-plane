@@ -34,6 +34,41 @@ interface Segment {
   share: number;
 }
 
+function LegendItem({
+  color,
+  label,
+  cells,
+  smCount,
+  hint,
+  outlined = false,
+}: {
+  color: string;
+  label: string;
+  cells: number;
+  smCount: number;
+  hint: string;
+  outlined?: boolean;
+}) {
+  return (
+    <div className="flex items-center gap-2" title={hint}>
+      <span
+        className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
+        style={{
+          background: color,
+          /* The idle swatch is barely distinguishable from the panel, so it
+           * carries a hairline to stay findable in the legend. */
+          boxShadow: outlined ? 'inset 0 0 0 1px var(--border-strong)' : undefined,
+        }}
+      />
+      <dt className="text-[11px] text-ink-secondary">{label}</dt>
+      <dd className="text-[11px] text-ink-muted tabular">
+        <span className="font-medium text-ink">{cells}</span>
+        {cells === 1 ? ' SM' : ' SMs'} · {Math.round((cells / smCount) * 100)}%
+      </dd>
+    </div>
+  );
+}
+
 export function SmGrid({ gpu, processes }: { gpu: Gpu; processes: GpuProcess[] }) {
   const smCount = gpu.smCount;
 
@@ -114,11 +149,14 @@ export function SmGrid({ gpu, processes }: { gpu: Gpu; processes: GpuProcess[] }
   }
   while (cells.length < smCount) cells.push({ color: 'var(--surface-2)', label: 'idle' });
 
+  const idleCells = smCount - Math.min(activeCells, smCount);
+
   return (
     <div className="mt-5">
       <div className="mb-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
         <h4 className="text-[11px] font-semibold tracking-wide text-ink-muted uppercase">
           SM occupancy
+          <span className="ml-2 font-normal normal-case">each cell = 1 SM</span>
         </h4>
         <span className="text-[11px] text-ink-muted tabular">
           {activeCells} of {smCount} SMs equivalent · {percent(gpu.utilization)}
@@ -143,17 +181,30 @@ export function SmGrid({ gpu, processes }: { gpu: Gpu; processes: GpuProcess[] }
         ))}
       </div>
 
-      {segments.length > 0 && (
-        <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1">
-          {segments.map((segment) => (
-            <span key={segment.key} className="flex items-center gap-1.5 text-[11px] text-ink-secondary">
-              <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: segment.color }} />
-              {segment.label}
-              <span className="font-medium text-ink tabular">{segment.cells}</span>
-            </span>
-          ))}
-        </div>
-      )}
+      {/* Every colour used in the grid is named here, idle included, so nothing
+        * on screen is left to be inferred from the fill alone. */}
+      <dl className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1.5">
+        {segments.map((segment) => (
+          <LegendItem
+            key={segment.key}
+            color={segment.color}
+            label={segment.label}
+            cells={segment.cells}
+            smCount={smCount}
+            hint="process using SM time"
+          />
+        ))}
+        {idleCells > 0 && (
+          <LegendItem
+            color="var(--surface-2)"
+            outlined
+            label="Idle"
+            cells={idleCells}
+            smCount={smCount}
+            hint="capacity not in use"
+          />
+        )}
+      </dl>
 
       <p className="mt-2 text-[11px] text-ink-muted">
         Proportional view: NVIDIA reports SM time for the GPU as a whole and per process, not per
