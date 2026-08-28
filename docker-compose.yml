@@ -1,0 +1,21 @@
+services:
+  spark-control-plane:
+    build: .
+    image: spark-control-plane:latest
+    container_name: spark-control-plane
+    restart: unless-stopped
+    ports:
+      # Loopback only by default. Change to "5555:5555" to reach it from the LAN.
+      - "127.0.0.1:5555:5555"
+    volumes:
+      # Node list and encrypted secrets survive a rebuild.
+      - ./config:/app/config
+      # SSH keys and known_hosts for remote collection.
+      - ~/.ssh:/root/.ssh:ro
+    environment:
+      PORT: 5555
+      BIND_HOST: 0.0.0.0
+      POLL_INTERVAL_MS: 2000
+      # Set this to a stable value to keep stored SSH passwords readable across
+      # rebuilds; otherwise a key is generated into ./config on first run.
+      # SECRET_KEY: change-me

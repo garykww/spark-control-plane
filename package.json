@@ -1,0 +1,38 @@
+{
+  "name": "spark-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Web control panel for NVIDIA DGX Spark (GB10) and other Linux GPU hosts",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "concurrently -n server,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "node --watch server/index.js",
+    "dev:web": "vite",
+    "build": "tsc --noEmit && vite build",
+    "start": "NODE_ENV=production node server/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"server/**/*.test.js\""
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.11",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^5.0.0",
+    "concurrently": "^9.2.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tailwindcss": "^4.1.11",
+    "typescript": "^5.8.3",
+    "vite": "^7.1.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}

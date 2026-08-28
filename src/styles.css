@@ -1,0 +1,189 @@
+@import 'tailwindcss';
+
+/*
+ * Design tokens. Light is defined on bare :root; the dark values are declared
+ * twice - once for the OS setting and once for an explicit theme stamp - so the
+ * in-app toggle wins in both directions.
+ *
+ * Series colours are a validated categorical palette (see README). Each metric
+ * owns a fixed slot so a colour always means the same thing across every panel.
+ */
+:root {
+  color-scheme: light;
+
+  --surface-0: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --surface-2: #f2f2ee;
+  --surface-raised: #ffffff;
+
+  --ink-primary: #0b0b0b;
+  --ink-secondary: #52514e;
+  --ink-muted: #898781;
+
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.1);
+  --border-strong: rgba(11, 11, 11, 0.18);
+
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+
+  --series-gpu: #2a78d6;
+  --series-cpu: #eb6834;
+  --series-memory: #1baf7a;
+  --series-temp: #eda100;
+  --series-llm: #e87ba4;
+  --series-power: #4a3aa7;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+
+    --surface-0: #0d0d0d;
+    --surface-1: #1a1a19;
+    --surface-2: #222220;
+    --surface-raised: #232322;
+
+    --ink-primary: #ffffff;
+    --ink-secondary: #c3c2b7;
+    --ink-muted: #898781;
+
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.1);
+    --border-strong: rgba(255, 255, 255, 0.18);
+
+    --series-gpu: #3987e5;
+    --series-cpu: #d95926;
+    --series-memory: #199e70;
+    --series-temp: #c98500;
+    --series-llm: #d55181;
+    --series-power: #9085e9;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --surface-0: #0d0d0d;
+  --surface-1: #1a1a19;
+  --surface-2: #222220;
+  --surface-raised: #232322;
+
+  --ink-primary: #ffffff;
+  --ink-secondary: #c3c2b7;
+  --ink-muted: #898781;
+
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.18);
+
+  --series-gpu: #3987e5;
+  --series-cpu: #d95926;
+  --series-memory: #199e70;
+  --series-temp: #c98500;
+  --series-llm: #d55181;
+  --series-power: #9085e9;
+}
+
+/* Pure black for OLED panels - inherits every other token from dark. */
+:root[data-theme='oled'] {
+  color-scheme: dark;
+
+  --surface-0: #000000;
+  --surface-1: #0a0a0a;
+  --surface-2: #131312;
+  --surface-raised: #151514;
+
+  --ink-primary: #ffffff;
+  --ink-secondary: #c3c2b7;
+  --ink-muted: #898781;
+
+  --grid: #232322;
+  --axis: #333331;
+  --border: rgba(255, 255, 255, 0.12);
+  --border-strong: rgba(255, 255, 255, 0.2);
+
+  --series-gpu: #3987e5;
+  --series-cpu: #d95926;
+  --series-memory: #199e70;
+  --series-temp: #c98500;
+  --series-llm: #d55181;
+  --series-power: #9085e9;
+}
+
+/* Expose the tokens to Tailwind so bg-surface-1, text-muted, etc. exist. */
+@theme inline {
+  --color-surface-0: var(--surface-0);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-raised: var(--surface-raised);
+
+  --color-ink: var(--ink-primary);
+  --color-ink-secondary: var(--ink-secondary);
+  --color-ink-muted: var(--ink-muted);
+
+  --color-grid: var(--grid);
+  --color-axis: var(--axis);
+  --color-hairline: var(--border);
+  --color-hairline-strong: var(--border-strong);
+
+  --color-good: var(--status-good);
+  --color-warning: var(--status-warning);
+  --color-serious: var(--status-serious);
+  --color-critical: var(--status-critical);
+
+  --color-gpu: var(--series-gpu);
+  --color-cpu: var(--series-cpu);
+  --color-memory: var(--series-memory);
+  --color-temp: var(--series-temp);
+  --color-llm: var(--series-llm);
+  --color-power: var(--series-power);
+
+  --font-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--surface-0);
+  color: var(--ink-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Columns of numbers must align; standalone figures keep proportional digits. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--axis);
+  border-radius: 5px;
+  border: 2px solid var(--surface-0);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+
+# Runtime state: node list, encrypted SSH passwords, generated encryption key.
+config/*
+!config/.gitkeep
+
+.env
+.DS_Store
+*.log
