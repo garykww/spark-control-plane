@@ -201,23 +201,32 @@ class NodeMonitor {
     return snapshot;
   }
 
-  /* CPU time is cumulative, so utilisation is the busy delta over the total delta. */
+  /*
+   * CPU time is cumulative, so utilisation is the busy delta over the total
+   * delta. The first poll after a connect has nothing to diff against, so it
+   * reports null - "not measured yet" - rather than 0, which would read as a
+   * genuinely idle machine.
+   */
   #deriveCpu(system, elapsedSeconds) {
     const prev = this.previous?.cpu;
     const current = system.cpuRaw.aggregate;
 
     const percentOf = (now, before) => {
-      if (!before) return 0;
+      if (!before) return null;
       const totalDelta = now.total - before.total;
-      if (totalDelta <= 0) return 0;
+      if (totalDelta <= 0) return null;
       return Math.min(100, Math.max(0, ((now.busy - before.busy) / totalDelta) * 100));
     };
+
+    const cores = prev?.cores
+      ? system.cpuRaw.cores.map((core, i) => percentOf(core, prev.cores[i]) ?? 0)
+      : [];
 
     return {
       model: system.cpu.model,
       cores: system.cpu.cores || system.cpuRaw.cores.length,
       percent: percentOf(current, prev?.aggregate),
-      cores_percent: system.cpuRaw.cores.map((core, i) => percentOf(core, prev?.cores?.[i])),
+      cores_percent: cores,
       runnable: system.cpuRaw.runnable,
       elapsedSeconds,
     };

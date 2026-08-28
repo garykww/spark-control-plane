@@ -14,7 +14,12 @@ export const SYSTEM_COMMANDS = {
   disk: 'df -B1 -P -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | tail -n +2',
   thermal: 'for z in /sys/class/thermal/thermal_zone*; do [ -r "$z/temp" ] && echo "$(cat $z/type 2>/dev/null):$(cat $z/temp)"; done',
   host: 'hostname; uname -r; uname -m; cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || tr -d "\\000" < /proc/device-tree/model 2>/dev/null || echo unknown',
-  cpuinfo: 'grep -m1 -E "^(model name|Model)" /proc/cpuinfo; nproc',
+  /*
+   * Arm SoCs (the GB10 included) have no "model name" in /proc/cpuinfo - only a
+   * numeric CPU part id - so lscpu, which decodes those ids, is asked first.
+   * A heterogeneous SoC reports one Model name per cluster.
+   */
+  cpuinfo: 'lscpu 2>/dev/null | grep -i "^model name"; grep -m1 -E "^(model name|Model)[[:space:]]*:" /proc/cpuinfo; nproc',
 };
 
 const num = (v) => {
@@ -161,11 +166,20 @@ export function parseHost(text) {
 
 export function parseCpuinfo(text) {
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-  const modelLine = lines.find((l) => l.includes(':'));
-  const coreLine = lines[lines.length - 1];
+
+  /* Every "<label>: <value>" line is a model candidate; the trailing bare
+   * number is nproc. Distinct values are joined so a big.LITTLE SoC reads
+   * "Cortex-X925 + Cortex-A725" rather than just its first cluster. */
+  const models = [];
+  for (const line of lines) {
+    if (!line.includes(':')) continue;
+    const value = line.split(':').slice(1).join(':').trim();
+    if (value && !models.includes(value)) models.push(value);
+  }
+
   return {
-    model: modelLine ? modelLine.split(':').slice(1).join(':').trim() : 'unknown',
-    cores: num(coreLine) || 0,
+    model: models.join(' + ') || 'unknown',
+    cores: num(lines[lines.length - 1]) || 0,
   };
 }
 

@@ -128,7 +128,8 @@ export interface NodeSnapshot {
   cpu?: {
     model: string;
     cores: number;
-    percent: number;
+    /* null until a second sample exists to diff against. */
+    percent: number | null;
     cores_percent: number[];
     runnable: number;
   };
