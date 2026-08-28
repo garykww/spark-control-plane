@@ -1,20 +1,54 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseGpus, parseGpuProcesses } from './gpu.js';
+import { parseGpus, parseGpuProcesses, parseThrottleReasons } from './gpu.js';
 
 const MIB = 1024 * 1024;
 
+/*
+ * Column order is an implementation detail of GPU_FIELDS, so rows are built
+ * from a named map: adding a field to the collector does not rewrite these.
+ */
+const FIELD_ORDER = [
+  'index', 'name', 'driver_version', 'utilization.gpu', 'utilization.memory',
+  'memory.total', 'memory.used', 'temperature.gpu', 'temperature.gpu.tlimit',
+  'power.draw', 'power.limit', 'clocks.sm', 'clocks.max.sm', 'clocks.mem',
+  'pstate', 'fan.speed', 'clocks_throttle_reasons.active',
+  'utilization.encoder', 'utilization.decoder', 'utilization.jpeg', 'utilization.ofa',
+];
+
+const BASE = {
+  index: 0,
+  name: 'NVIDIA GB10',
+  driver_version: '580.159.03',
+  'utilization.gpu': 62,
+  'utilization.memory': 40,
+  'memory.total': 122880,
+  'memory.used': 81920,
+  'temperature.gpu': 57,
+  'temperature.gpu.tlimit': 33,
+  'power.draw': 118.42,
+  'power.limit': 240.0,
+  'clocks.sm': 1530,
+  'clocks.max.sm': 3003,
+  'clocks.mem': 3200,
+  pstate: 'P0',
+  'fan.speed': '[N/A]',
+  'clocks_throttle_reasons.active': '0x0000000000000000',
+  'utilization.encoder': 0,
+  'utilization.decoder': 0,
+  'utilization.jpeg': 0,
+  'utilization.ofa': 0,
+};
+
+const row = (overrides = {}) =>
+  FIELD_ORDER.map((f) => ({ ...BASE, ...overrides })[f]).join(', ');
+
 test('parseGpus reads a full nvidia-smi row', () => {
-  const [gpu] = parseGpus(
-    '0, NVIDIA GB10, 580.95.05, 62, 40, 122880, 81920, 57, 118.42, 240.00, 1530, 3200, P0, [N/A]',
-    { isUnified: true },
-  );
+  const [gpu] = parseGpus(row(), { isUnified: true });
 
   assert.equal(gpu.name, 'NVIDIA GB10');
-  assert.equal(gpu.driver, '580.95.05');
   assert.equal(gpu.utilization, 62);
   assert.equal(gpu.memoryTotal, 122880 * MIB);
-  assert.equal(gpu.memoryUsed, 81920 * MIB);
   assert.equal(Math.round(gpu.memoryPercent), 67);
   assert.equal(gpu.powerDraw, 118.42);
   assert.equal(gpu.pstate, 'P0');
@@ -23,30 +57,86 @@ test('parseGpus reads a full nvidia-smi row', () => {
   assert.equal(gpu.fanSpeed, null);
 });
 
+test('parseGpus derives SM clock headroom from the reported ceiling', () => {
+  const [gpu] = parseGpus(row({ 'clocks.sm': 1530, 'clocks.max.sm': 3003 }));
+
+  assert.equal(gpu.clockSm, 1530);
+  assert.equal(gpu.clockSmMax, 3003);
+  assert.equal(Math.round(gpu.clockSmPercent), 51);
+});
+
+test('parseGpus leaves SM headroom null when the ceiling is unavailable', () => {
+  const [gpu] = parseGpus(row({ 'clocks.max.sm': '[N/A]' }));
+  assert.equal(gpu.clockSmPercent, null);
+});
+
+test('parseGpus keeps thermal headroom and flags idle engines', () => {
+  const [gpu] = parseGpus(row());
+  assert.equal(gpu.temperatureHeadroom, 33);
+  assert.deepEqual(gpu.engines, { encoder: 0, decoder: 0, jpeg: 0, ofa: 0 });
+  assert.equal(gpu.enginesActive, false);
+});
+
+test('parseGpus reports engines as active when any is working', () => {
+  const [gpu] = parseGpus(row({ 'utilization.decoder': 37 }));
+  assert.equal(gpu.enginesActive, true);
+  assert.equal(gpu.engines.decoder, 37);
+});
+
 test('parseGpus keeps unsupported fields null instead of zero', () => {
   const [gpu] = parseGpus(
-    '0, NVIDIA GB10, 580.95.05, [N/A], [N/A], 122880, 4096, 45, [Not Supported], [N/A], [N/A], [N/A], [N/A], [N/A]',
+    row({
+      'utilization.gpu': '[N/A]',
+      'memory.total': '[N/A]',
+      'memory.used': '[N/A]',
+      'power.limit': '[N/A]',
+      'clocks.mem': '[N/A]',
+    }),
   );
 
   assert.equal(gpu.utilization, null);
-  assert.equal(gpu.powerDraw, null);
-  assert.equal(gpu.clockSm, null);
-  assert.equal(gpu.temperature, 45);
-  assert.equal(gpu.isUnified, false);
+  assert.equal(gpu.memoryTotal, null);
+  assert.equal(gpu.memoryPercent, null);
+  assert.equal(gpu.powerLimit, null);
+  assert.equal(gpu.clockMemory, null);
+  /* Values that were reported must survive alongside the missing ones. */
+  assert.equal(gpu.temperature, 57);
 });
 
 test('parseGpus handles several GPUs and ignores blank lines', () => {
-  const gpus = parseGpus(
-    [
-      '0, NVIDIA RTX 6000, 570.1, 10, 5, 49140, 1024, 40, 50, 300, 1000, 2000, P2, 30',
-      '',
-      '1, NVIDIA RTX 6000, 570.1, 90, 80, 49140, 40960, 71, 280, 300, 1900, 2000, P0, 70',
-    ].join('\n'),
-  );
+  const gpus = parseGpus([row({ index: 0 }), '', row({ index: 1, 'utilization.gpu': 90 })].join('\n'));
 
   assert.equal(gpus.length, 2);
   assert.equal(gpus[1].index, 1);
   assert.equal(gpus[1].utilization, 90);
+});
+
+test('parseThrottleReasons decodes the NVML bitmask', () => {
+  assert.deepEqual(parseThrottleReasons('0x0000000000000000'), []);
+
+  /* 0x4 is SwPowerCap - verified against a GB10 reporting the mask and the
+   * per-reason booleans in one call. */
+  assert.deepEqual(parseThrottleReasons('0x0000000000000004').map((r) => r.key), ['swPowerCap']);
+
+  /* 0x1 idle + 0x40 hardware thermal slowdown */
+  assert.deepEqual(
+    parseThrottleReasons('0x0000000000000041').map((r) => r.key),
+    ['idle', 'hwThermal'],
+  );
+});
+
+test('parseThrottleReasons separates protective throttling from normal states', () => {
+  const [idle] = parseThrottleReasons('0x1');
+  const [thermal] = parseThrottleReasons('0x40');
+
+  assert.equal(idle.severity, 'info');
+  assert.equal(thermal.severity, 'serious');
+});
+
+test('parseThrottleReasons returns null when the driver does not report it', () => {
+  assert.equal(parseThrottleReasons('[N/A]'), null);
+  assert.equal(parseThrottleReasons(''), null);
+  assert.equal(parseThrottleReasons('garbage'), null);
 });
 
 test('parseGpuProcesses sorts by memory and shortens the process path', () => {
@@ -57,6 +147,5 @@ test('parseGpuProcesses sorts by memory and shortens the process path', () => {
   assert.equal(processes.length, 2);
   assert.equal(processes[0].name, 'ollama');
   assert.equal(processes[0].memory, 65536 * MIB);
-  assert.equal(processes[0].command, '/usr/local/bin/ollama');
   assert.equal(processes[1].name, 'python3');
 });

@@ -87,10 +87,21 @@ export function demoSnapshot(node, index = 0) {
         temperature,
         powerDraw: power,
         powerLimit: DGX_SPARK_SPEC.powerWatts,
-        clockSm: Math.round(scaled(seed + 5, 19, t, 1250, 400, 300, 1700)),
+        temperatureHeadroom: Math.max(0, Math.round(88 - temperature)),
+        clockSm: Math.round(scaled(seed + 5, 19, t, 1250, 400, 300, 3003)),
+        clockSmMax: 3003,
+        clockSmPercent: clamp((scaled(seed + 5, 19, t, 1250, 400, 300, 3003) / 3003) * 100, 0, 100),
         clockMemory: 3200,
         pstate: gpuUtil > 40 ? 'P0' : 'P8',
         fanSpeed: null,
+        throttleReasons:
+          gpuUtil < 12
+            ? [{ key: 'idle', label: 'Idle', severity: 'info' }]
+            : temperature > 66
+              ? [{ key: 'swPowerCap', label: 'Power cap', severity: 'warning' }]
+              : [],
+        engines: { encoder: 0, decoder: 0, jpeg: 0, ofa: 0 },
+        enginesActive: false,
         isUnified: node.type === 'dgx-spark',
       },
     ],

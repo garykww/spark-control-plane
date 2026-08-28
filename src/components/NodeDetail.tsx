@@ -15,6 +15,7 @@ import {
 } from '../lib/format';
 import { Badge, Button, Card, CoreGrid, StatTile, StatusDot } from './ui';
 import { ContainersPanel } from './ContainersPanel';
+import { SmStatus } from './SmStatus';
 import { Dial } from './viz/Dial';
 import { LineChart } from './viz/LineChart';
 import { Meter } from './viz/Meter';
@@ -31,6 +32,16 @@ interface Props {
 
 export function NodeDetail({ node, config, history, onEdit, onPower, onNotice }: Props) {
   const gpu = node.gpus[0];
+
+  /*
+   * nvidia-smi reports [N/A] for memory on GB10, because there is no discrete
+   * VRAM to report - the GPU's memory *is* the system's unified pool. Fall back
+   * to it so the panel shows the real figure instead of a dash.
+   */
+  const gpuMemoryUsed = gpu?.memoryUsed ?? (gpu?.isUnified ? node.memory?.used ?? null : null);
+  const gpuMemoryTotal = gpu?.memoryTotal ?? (gpu?.isUnified ? node.memory?.total ?? null : null);
+  const gpuMemoryPercent =
+    gpu?.memoryPercent ?? (gpu?.isUnified ? node.memory?.percent ?? null : null);
 
   if (!node.online) {
     return (
@@ -70,8 +81,8 @@ export function NodeDetail({ node, config, history, onEdit, onPower, onNotice }:
           <div className="grid flex-1 grid-cols-2 gap-x-6 gap-y-5 sm:grid-cols-4">
             <StatTile
               label={gpu?.isUnified ? 'Unified memory' : 'VRAM'}
-              value={bytes(gpu?.memoryUsed)}
-              sub={`of ${bytes(gpu?.memoryTotal)} · ${percent(gpu?.memoryPercent)}`}
+              value={bytes(gpuMemoryUsed)}
+              sub={`of ${bytes(gpuMemoryTotal)} · ${percent(gpuMemoryPercent)}`}
             />
             <StatTile label="Temperature" value={celsius(gpu?.temperature)} sub={gpu?.pstate ? `state ${gpu.pstate}` : undefined} />
             <StatTile
@@ -82,6 +93,8 @@ export function NodeDetail({ node, config, history, onEdit, onPower, onNotice }:
             <StatTile label="SM clock" value={megahertz(gpu?.clockSm)} sub={gpu?.driver ? `driver ${gpu.driver}` : undefined} />
           </div>
         </div>
+
+        {gpu && <SmStatus gpu={gpu} />}
 
         {history && history.gpuUtilization.length > 1 && (
           <div className="mt-6 grid gap-6 md:grid-cols-2">

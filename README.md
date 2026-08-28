@@ -11,6 +11,7 @@ Nodes are added and edited from the UI. There's no config file to hand-write and
 Each node gets a summary card on the Overview tab and a full page of its own:
 
 - **GPU** — utilisation, memory, temperature, power draw, SM clock, and the processes holding VRAM
+- **SM status** — how much of the SM clock ceiling is in use, what is capping it, and how much thermal headroom is left
 - **Unified memory** — on GB10 the CPU and GPU share one LPDDR5X pool, and the UI labels it as such instead of pretending there's separate VRAM
 - **CPU** — aggregate and per-core utilisation, load averages
 - **Storage and network** — per-mount capacity, per-interface throughput
@@ -110,6 +111,24 @@ browser ──WebSocket /ws──> Monitor ──> NodeMonitor (one per node)
                                              └─ HTTP probe ──────────> inference server /metrics
 ```
 
+## What "SM status" can and can't tell you
+
+There is **no per-SM breakdown available**. Neither NVML nor DCGM exposes individual streaming multiprocessors, so a grid of SMs like the per-core CPU one cannot be built — `utilization.gpu` is the fraction of time at least one kernel was resident, averaged across the whole GPU. Anything claiming otherwise is estimating.
+
+What *is* knowable is why the SMs are running at the speed they are, which is usually the question behind "what are my SMs doing". The panel shows:
+
+- **SM clock against its ceiling** — e.g. 2.38 GHz of a 3.00 GHz maximum, so you can see boost headroom at a glance
+- **SM activity** — the residency figure above, labelled for what it actually measures
+- **Clock limiters** — NVML's clock-event reasons decoded: power cap, thermal throttle, hardware slowdown, application clock limits. This is the part that explains a slow run.
+- **Thermal headroom** — degrees left before the driver starts cutting clocks
+- **Fixed-function engines** — encoder, decoder, JPEG and optical flow, shown only when one is actually working
+
+All of it comes from the `nvidia-smi` query the poll already makes, so it costs no extra round trip.
+
+An idle GPU parks its clocks and briefly asserts a power-cap bit while doing so. The panel says "the SMs are idle, so low clocks are expected" rather than warning about throughput you weren't using. Protective throttling — thermal or hardware slowdown — is always called out, whatever the load.
+
+If you want deeper counters — SM occupancy, tensor-core activity, achieved memory bandwidth — those need DCGM (`DCGM_FI_PROF_*` fields), which is a separate NVIDIA package and isn't wired up here.
+
 ## Containers
 
 The node detail page lists every container `docker ps -a` reports, running ones first, and gives you **Start**, **Stop**, and **Restart** on each row. Stopping asks for confirmation first.
@@ -171,7 +190,9 @@ src/
 
 ## Things worth knowing
 
-**Memory bandwidth isn't measurable from userspace.** The GB10's 273 GB/s figure is shown as a platform spec, not a live reading. Nothing exposes actual achieved bandwidth.
+**Memory bandwidth isn't measurable from `nvidia-smi`.** The GB10's 273 GB/s figure is shown as a platform spec, not a live reading. Achieved bandwidth needs DCGM's profiling fields, which aren't wired up here.
+
+**GB10 reports no discrete VRAM.** `nvidia-smi` returns `[N/A]` for `memory.total`, `memory.used` and `power.limit`, because the GPU's memory *is* the system's unified pool. The GPU panel falls back to the system memory figures rather than showing dashes.
 
 **Inference ports are probed over plain HTTP from wherever the dashboard runs**, not through the SSH tunnel. If a model server only listens on `127.0.0.1` on the node, the dashboard can't see it. Bind it to the LAN interface, or run the dashboard on that node.
 

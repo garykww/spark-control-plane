@@ -23,6 +23,19 @@ export interface NodeConfig {
   hasPassword: boolean;
 }
 
+export interface ThrottleReason {
+  key: string;
+  label: string;
+  severity: 'info' | 'warning' | 'serious';
+}
+
+export interface GpuEngines {
+  encoder: number | null;
+  decoder: number | null;
+  jpeg: number | null;
+  ofa: number | null;
+}
+
 export interface Gpu {
   index: number;
   name: string;
@@ -33,12 +46,20 @@ export interface Gpu {
   memoryUsed: number | null;
   memoryPercent: number | null;
   temperature: number | null;
+  /* Degrees left before the driver starts cutting clocks. */
+  temperatureHeadroom: number | null;
   powerDraw: number | null;
   powerLimit: number | null;
   clockSm: number | null;
+  clockSmMax: number | null;
+  clockSmPercent: number | null;
   clockMemory: number | null;
   pstate: string | null;
   fanSpeed: number | null;
+  /* null when the driver does not report clock-event reasons at all. */
+  throttleReasons: ThrottleReason[] | null;
+  engines: GpuEngines;
+  enginesActive: boolean;
   isUnified: boolean;
 }
 
