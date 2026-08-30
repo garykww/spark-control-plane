@@ -124,6 +124,71 @@ export interface Container {
 
 export type ContainerAction = 'start' | 'stop' | 'restart';
 
+export type HfRepoType = 'model' | 'dataset' | 'space';
+export type HfJobStatus =
+  | 'starting'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'cancelled'
+  | 'blocked'
+  | 'orphaned';
+
+export interface HfRepo {
+  id: string;
+  repoId: string;
+  repoType: HfRepoType;
+  /* null when hf reported a size it could not express in bytes. */
+  sizeBytes: number | null;
+  sizeText: string;
+  lastAccessed: string;
+  lastModified: string;
+  refs: string[];
+}
+
+export interface HfJob {
+  id: string;
+  repoId: string;
+  repoType: HfRepoType;
+  revision: string | null;
+  status: HfJobStatus;
+  totalBytes: number | null;
+  downloadedBytes: number;
+  /* null when the total could not be determined - show bytes, not a fake bar. */
+  percent: number | null;
+  message: string | null;
+  startedAt: number | null;
+}
+
+export interface HfState {
+  available: boolean;
+  error: string | null;
+  bin: string | null;
+  version: string | null;
+  /* null means hf is installed but nobody is logged in. */
+  user: string | null;
+  cacheDir: string | null;
+  repos: HfRepo[];
+  totalBytes: number;
+  jobs: HfJob[];
+  reclaimable: {
+    incompleteFiles: number;
+    incompleteBytes: number;
+    pruneBytes: number | null;
+    pruneRevisions: number;
+  };
+  scannedAt: number | null;
+}
+
+export interface HfDeletePreview {
+  repoId: string;
+  repoType: HfRepoType;
+  repos: number;
+  revisions: number;
+  sizeText: string;
+  sizeBytes: number | null;
+}
+
 export interface SparkSpec {
   platform: string;
   soc: string;
@@ -174,6 +239,7 @@ export interface NodeSnapshot {
   /* False when Docker is absent or unreachable; dockerError says which. */
   dockerAvailable: boolean;
   dockerError: string | null;
+  hf: HfState;
   thermal: ThermalZone[];
   storage: Mount[];
   network: Interface[];

@@ -17,6 +17,7 @@ Each node gets a summary card on the Overview tab and a full page of its own:
 - **Storage and network** — per-mount capacity, per-interface throughput
 - **Inference** — auto-detects vLLM, llama.cpp, SGLang, TGI, and Ollama, then tracks decode/prefill tokens per second, queue depth, and KV cache usage
 - **Containers** — every Docker container on the node, with start, stop, and restart buttons
+- **HuggingFace cache** — cached models and datasets with sizes, plus download, delete, and space reclaim
 - **Thermals** — every thermal zone the kernel exposes
 
 Metrics stream over a WebSocket. History is kept on the server, so a browser refresh or a second viewer sees the same continuous chart rather than starting from an empty one.
@@ -88,6 +89,7 @@ Every setting is an environment variable, and every one is optional. `.env.examp
 | `HISTORY_LENGTH` | `300` | Samples kept per metric (300 × 2s = 10 minutes of chart) |
 | `OFFLINE_THRESHOLD` | `3` | Failed polls before a node is shown as offline |
 | `SECRET_KEY` | generated | Encrypts stored SSH passwords |
+| `HF_CACHE_INTERVAL_MS` | `30000` | How often the HuggingFace cache is re-listed |
 | `DEMO_MODE` | off | Serve synthetic metrics |
 
 Runtime state lives in `config/`: `nodes.json` holds the node list, `nodes-secrets.json` holds SSH passwords encrypted with AES-256-GCM, and `.secret-key` holds the generated key when you haven't set `SECRET_KEY`. All three are gitignored.
@@ -132,6 +134,26 @@ All of it comes from the `nvidia-smi` query the poll already makes, so it costs 
 An idle GPU parks its clocks and briefly asserts a power-cap bit while doing so. The panel says "the SMs are idle, so low clocks are expected" rather than warning about throughput you weren't using. Protective throttling — thermal or hardware slowdown — is always called out, whatever the load.
 
 If you want deeper counters — SM occupancy, tensor-core activity, achieved memory bandwidth — those need DCGM (`DCGM_FI_PROF_*` fields), which is a separate NVIDIA package and isn't wired up here.
+
+## HuggingFace models
+
+The node detail page lists every model and dataset in the node's HuggingFace cache, largest first, with a type filter and the total. On a Spark this is usually the biggest thing on the disk — 588 GB across 28 repos on the machine this was built against.
+
+**Downloading.** Type a repo id (`Qwen/Qwen3-8B`), pick model or dataset, and hit Download. The download runs *detached on the node*: it survives closing the page, restarting the dashboard, and dropping the SSH connection. Progress comes back on the normal poll. Only one download runs at a time per node.
+
+**Deleting.** Delete asks the node what the repo actually costs (`hf cache rm --dry-run`) and shows that figure — "Frees 71.9 GB across 1 revision" — before you confirm. Deleting weights is irreversible and re-downloading 70 GB takes hours, so the number comes from HuggingFace rather than being estimated.
+
+**Reclaiming.** Two kinds of dead weight are reported separately, because `hf cache prune` only handles one of them: unfinished downloads (`.incomplete` blobs left by an interrupted pull) and detached revisions. Partials younger than an hour are never swept, and both actions are refused while a download is running.
+
+The panel needs the `hf` CLI on the node. It hides itself entirely when `hf` isn't installed, and says so when it's installed but nobody is signed in — the usual reason a gated repo fails:
+
+```bash
+hf auth login     # on the node, for gated or private repos
+```
+
+> **Note**: `hf` is often installed in `~/.local/bin`, which a login shell adds to `PATH` but `ssh host command` does not. The collector searches the usual locations rather than assuming `PATH`, so it works without you changing anything on the node.
+
+Sizes come from `hf` itself, which reports in decimal units (a repo `du` measures at 999,588,026 bytes is reported as `999.6M`). The dashboard displays binary units like it does for memory and disk, so a figure here can differ by a few percent from what the `hf` CLI prints.
 
 ## Containers
 
@@ -183,11 +205,12 @@ server/
   secrets.js        AES-256-GCM password storage
   power.js          shutdown, reboot, Wake-on-LAN
   containers.js     docker start / stop / restart
-  collectors/       /proc + /sys, nvidia-smi, docker ps, inference probes, demo data
+  huggingface.js    model download / delete / reclaim
+  collectors/       /proc + /sys, nvidia-smi, docker ps, hf cache, inference probes, demo data
   exec/             local and SSH command runners, batching
 src/
   App.tsx           shell, tabs, fleet summary
-  components/       node cards, detail panels, container list, add/edit dialog
+  components/       node cards, detail panels, container list, model cache, add/edit dialog
   components/viz/   sparkline, line chart, dial, meter
   hooks/            WebSocket state, element sizing
 ```

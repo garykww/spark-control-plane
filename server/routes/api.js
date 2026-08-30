@@ -8,6 +8,15 @@ import { getPassword } from '../secrets.js';
 import { probeLlmEndpoint } from '../collectors/llm.js';
 import { powerAction, wakeOnLan } from '../power.js';
 import { containerAction } from '../containers.js';
+import {
+  startDownload,
+  cancelDownload,
+  clearJob,
+  previewDelete,
+  deleteRepo,
+  reclaim,
+} from '../huggingface.js';
+import { ACTIVE_STATUSES } from '../collectors/huggingface.js';
 import { DGX_SPARK_SPEC } from '../collectors/specs.js';
 
 export const api = express.Router();
@@ -139,6 +148,66 @@ api.post('/nodes/:id/containers/:containerId/:action', route(async (req, res) =>
   const result = await containerAction(node, req.params.containerId, req.params.action);
   /* Re-poll promptly so the UI reflects the new state without waiting a full tick. */
   monitor.refreshSoon(req.params.id);
+  res.json(result);
+}));
+
+/*
+ * HuggingFace cache management. Downloads are launched detached on the node and
+ * their state is polled, so this route returns as soon as the job is running,
+ * not when it finishes - a 70 GB pull takes hours.
+ */
+api.post('/nodes/:id/hf/downloads', route(async (req, res) => {
+  const node = requireNode(req);
+  const result = await startDownload(node, req.body ?? {});
+  monitor.refreshHf(req.params.id);
+  res.status(201).json(result);
+}));
+
+api.post('/nodes/:id/hf/downloads/:jobId/cancel', route(async (req, res) => {
+  const node = requireNode(req);
+  const result = await cancelDownload(node, req.params.jobId);
+  monitor.refreshHf(req.params.id);
+  res.json(result);
+}));
+
+api.delete('/nodes/:id/hf/jobs/:jobId', route(async (req, res) => {
+  const node = requireNode(req);
+  await clearJob(node, req.params.jobId);
+  monitor.refreshHf(req.params.id);
+  res.status(204).end();
+}));
+
+/* Preview first, so the confirm dialog can state the real cost of the delete. */
+api.post('/nodes/:id/hf/preview-delete', route(async (req, res) => {
+  const node = requireNode(req);
+  res.json(await previewDelete(node, req.body ?? {}));
+}));
+
+api.post('/nodes/:id/hf/delete', route(async (req, res) => {
+  const node = requireNode(req);
+  const result = await deleteRepo(node, req.body ?? {});
+  monitor.refreshHf(req.params.id);
+  res.json(result);
+}));
+
+api.post('/nodes/:id/hf/reclaim', route(async (req, res) => {
+  const node = requireNode(req);
+  const target = String(req.body?.target ?? '');
+
+  /*
+   * Partial blobs belonging to a live download must not be swept. The job script
+   * also guards this with a 60-minute age filter; this is the earlier, clearer
+   * refusal.
+   */
+  if (target === 'incomplete') {
+    const hf = monitor.hfFor(req.params.id);
+    if (hf?.jobs.some((job) => ACTIVE_STATUSES.has(job.status))) {
+      throw new ValidationError('a download is in progress - wait for it to finish before reclaiming');
+    }
+  }
+
+  const result = await reclaim(node, target);
+  monitor.refreshHf(req.params.id);
   res.json(result);
 }));
 

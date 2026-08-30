@@ -31,6 +31,11 @@ export const config = {
   /* Consecutive poll failures before a node is marked offline. */
   offlineThreshold: int(process.env.OFFLINE_THRESHOLD, 3),
 
+  /* The HuggingFace cache listing is ~0.4s and rarely changes, so it runs on its
+   * own slow cadence rather than with the 2s metrics batch. */
+  hfCacheIntervalMs: int(process.env.HF_CACHE_INTERVAL_MS, 30000),
+  hfCommandTimeoutMs: int(process.env.HF_COMMAND_TIMEOUT_MS, 25000),
+
   /* Key used to encrypt stored SSH passwords. Generated on first run if unset. */
   secretKey: process.env.SECRET_KEY || null,
 

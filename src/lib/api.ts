@@ -1,4 +1,4 @@
-import type { ContainerAction, NodeConfig, TestResult } from './types';
+import type { ContainerAction, HfDeletePreview, HfRepoType, NodeConfig, TestResult } from './types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
@@ -55,4 +55,36 @@ export const api = {
 
   container: (nodeId: string, containerId: string, action: ContainerAction) =>
     request<{ ok: boolean }>(`/nodes/${nodeId}/containers/${containerId}/${action}`, { method: 'POST' }),
+
+  /* Returns as soon as the download is running on the node, not when it finishes. */
+  hfDownload: (nodeId: string, body: { repoId: string; repoType: HfRepoType; revision?: string | null }) =>
+    request<{ ok: boolean; jobId: string }>(`/nodes/${nodeId}/hf/downloads`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  hfCancel: (nodeId: string, jobId: string) =>
+    request<{ ok: boolean }>(`/nodes/${nodeId}/hf/downloads/${jobId}/cancel`, { method: 'POST' }),
+
+  hfClearJob: (nodeId: string, jobId: string) =>
+    request<void>(`/nodes/${nodeId}/hf/jobs/${jobId}`, { method: 'DELETE' }),
+
+  hfPreviewDelete: (nodeId: string, body: { repoId: string; repoType: HfRepoType }) =>
+    request<HfDeletePreview>(`/nodes/${nodeId}/hf/preview-delete`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /* `confirm` must echo the repo id; the server refuses otherwise. */
+  hfDelete: (nodeId: string, body: { repoId: string; repoType: HfRepoType; confirm: string }) =>
+    request<{ ok: boolean; freedBytes: number | null }>(`/nodes/${nodeId}/hf/delete`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  hfReclaim: (nodeId: string, target: 'incomplete' | 'prune') =>
+    request<{ ok: boolean; files?: number; revisions?: number; freedBytes: number | null }>(
+      `/nodes/${nodeId}/hf/reclaim`,
+      { method: 'POST', body: JSON.stringify({ target }) },
+    ),
 };

@@ -161,6 +161,38 @@ export function demoSnapshot(node, index = 0) {
     ],
     dockerAvailable: true,
     dockerError: null,
+    hf: {
+      available: true,
+      error: null,
+      bin: '/home/nvidia/.local/bin/hf',
+      version: '1.17.0',
+      user: 'demo-user',
+      cacheDir: '/home/nvidia/.cache/huggingface',
+      repos: [
+        { id: 'model/Qwen/Qwen3.6-35B-A3B', repoId: 'Qwen/Qwen3.6-35B-A3B', repoType: 'model', sizeBytes: 71.9e9, sizeText: '71.9G', lastAccessed: '3 months ago', lastModified: '3 months ago', refs: ['main'] },
+        { id: 'model/google/gemma-4-31B-it', repoId: 'google/gemma-4-31B-it', repoType: 'model', sizeBytes: 62.6e9, sizeText: '62.6G', lastAccessed: '2 days ago', lastModified: '2 days ago', refs: ['main'] },
+        { id: 'dataset/Skylion007/openwebtext', repoId: 'Skylion007/openwebtext', repoType: 'dataset', sizeBytes: 24.2e9, sizeText: '24.2G', lastAccessed: '1 day ago', lastModified: '1 day ago', refs: ['main'] },
+        { id: 'model/openai/whisper-large-v3-turbo', repoId: 'openai/whisper-large-v3-turbo', repoType: 'model', sizeBytes: 1.62e9, sizeText: '1.6G', lastAccessed: '3 weeks ago', lastModified: '3 weeks ago', refs: ['main'] },
+      ],
+      totalBytes: 160.32e9,
+      /* One live download so the progress affordance is exercised in demo mode. */
+      jobs: gpuUtil > 20
+        ? [{
+            id: 'job-1788000000000-demo0001',
+            repoId: 'meta-llama/Llama-3.3-70B-Instruct',
+            repoType: 'model',
+            revision: null,
+            status: 'running',
+            totalBytes: 141e9,
+            downloadedBytes: Math.round(141e9 * clamp(gpuUtil / 130, 0.02, 0.97)),
+            percent: clamp((gpuUtil / 130) * 100, 2, 97),
+            message: 'Downloading shards',
+            startedAt: Math.floor(Date.now() / 1000) - 900,
+          }]
+        : [],
+      reclaimable: { incompleteFiles: 6, incompleteBytes: 7.86e9, pruneBytes: 0.999e9, pruneRevisions: 4 },
+      scannedAt: Date.now(),
+    },
     llm: [
       {
         id: 'demo:8000',

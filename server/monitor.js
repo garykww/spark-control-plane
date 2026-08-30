@@ -12,6 +12,19 @@ import {
   parseSmCount,
 } from './collectors/gpu.js';
 import { DOCKER_COMMANDS, parseContainers } from './collectors/docker.js';
+import {
+  HF_PROBE_COMMAND,
+  HF_CACHE_COMMANDS,
+  HF_JOB_COMMANDS,
+  ACTIVE_STATUSES,
+  EMPTY_HF,
+  parseHfProbe,
+  parseCacheList,
+  parseIncomplete,
+  parsePrune,
+  parseJobs,
+  summariseHf,
+} from './collectors/huggingface.js';
 import { probeLlmEndpoints } from './collectors/llm.js';
 import { demoSnapshot } from './collectors/demo.js';
 import { specForNode } from './collectors/specs.js';
@@ -49,6 +62,16 @@ class NodeMonitor {
     /* Fixed hardware facts, probed once per connection rather than every poll. */
     this.smCount = null;
     this.smCountProbed = false;
+
+    /* HuggingFace state. The cache listing runs on its own slow cadence; job
+     * state is polled every tick, but only while a download is actually live. */
+    this.hf = EMPTY_HF;
+    this.hfProbe = null;
+    this.hfProbed = false;
+    this.hfNextAt = 0;
+    this.hfCache = null;
+    this.hfIncomplete = null;
+    this.hfPrune = null;
   }
 
   #offlineSnapshot(node, error) {
@@ -62,6 +85,7 @@ class NodeMonitor {
       spec: specForNode(node),
       gpus: [],
       gpuProcesses: [],
+      hf: EMPTY_HF,
       containers: [],
       dockerAvailable: false,
       dockerError: null,
@@ -79,6 +103,12 @@ class NodeMonitor {
   /* Docker needs a moment to settle after start/stop before `docker ps` is accurate. */
   pollSoon() {
     this.#scheduleNext(400);
+  }
+
+  /* Forces the next poll to re-read the HuggingFace cache, after a write. */
+  markHfStale() {
+    this.hfNextAt = 0;
+    this.pollSoon();
   }
 
   #scheduleNext(delay = config.pollIntervalMs) {
@@ -100,6 +130,8 @@ class NodeMonitor {
     this.runner = null;
     /* Credentials or the host itself may have changed; re-probe the hardware. */
     this.smCountProbed = false;
+    this.hfProbed = false;
+    this.hfNextAt = 0;
     old?.close?.();
   }
 
@@ -160,11 +192,14 @@ class NodeMonitor {
     this.runner ??= createRunner(node);
     await this.#probeSmCount();
 
+    /* The HuggingFace collection runs alongside the metrics batch rather than
+     * after it, so its latency overlaps instead of adding to the poll. */
     const [sections, llmProbes] = await Promise.all([
       runBatch(this.runner, { ...SYSTEM_COMMANDS, ...GPU_COMMANDS, ...DOCKER_COMMANDS }),
       probeLlmEndpoints(
         (node.llmPorts ?? []).map((p) => ({ host: node.host, port: p.port, label: p.label })),
       ),
+      this.#collectHf(),
     ]);
 
     const system = parseSystem(sections);
@@ -195,6 +230,7 @@ class NodeMonitor {
       },
       gpus,
       gpuProcesses: this.#mergeProcesses(sections),
+      hf: this.hf,
       containers: docker.containers,
       dockerAvailable: docker.available,
       dockerError: docker.error,
@@ -227,6 +263,67 @@ class NodeMonitor {
       this.smCount = parseSmCount(stdout);
     } catch {
       this.smCount = null;
+    }
+  }
+
+  /*
+   * Locates the hf CLI and reads its identity once per connection. It is not on
+   * the non-interactive SSH PATH on a DGX Spark, and `auth whoami` costs a
+   * network round trip, so this stays out of the per-poll path.
+   */
+  async #probeHf() {
+    if (this.hfProbed) return;
+    this.hfProbed = true;
+    try {
+      const { stdout } = await this.runner.run(HF_PROBE_COMMAND, 12000);
+      this.hfProbe = parseHfProbe(stdout);
+    } catch {
+      this.hfProbe = null;
+    }
+  }
+
+  /*
+   * Collects HuggingFace state on a cadence of its own: the cache listing every
+   * hfCacheIntervalMs, and job state on every poll but only while a download is
+   * live. Never throws - a failure here must not take a node offline.
+   */
+  async #collectHf() {
+    try {
+      await this.#probeHf();
+      if (!this.hfProbe?.bin) return;
+
+      const active = this.hf.jobs.some((job) => ACTIVE_STATUSES.has(job.status));
+      const cacheDue = Date.now() >= this.hfNextAt;
+      if (!active && !cacheDue) return;
+
+      const sections = await runBatch(
+        this.runner,
+        { ...HF_JOB_COMMANDS, ...(cacheDue ? HF_CACHE_COMMANDS : {}) },
+        config.hfCommandTimeoutMs,
+      );
+
+      const jobs = parseJobs(sections.hfJobs || '');
+
+      if (cacheDue) {
+        this.hfCache = parseCacheList(sections.hfCache || '');
+        this.hfIncomplete = parseIncomplete(sections.hfIncomplete || '');
+        this.hfPrune = parsePrune(sections.hfPrune || '');
+        this.hfNextAt = Date.now() + config.hfCacheIntervalMs;
+      }
+
+      /* A download that just finished changed the cache - re-read it next tick
+       * rather than leaving a stale listing for up to half a minute. */
+      if (active && !jobs.some((job) => ACTIVE_STATUSES.has(job.status))) this.hfNextAt = 0;
+
+      this.hf = summariseHf({
+        probe: this.hfProbe,
+        cache: this.hfCache,
+        incomplete: this.hfIncomplete,
+        prune: this.hfPrune,
+        jobs,
+      });
+    } catch {
+      /* Leave the last good HuggingFace state in place. */
     }
   }
 
@@ -368,6 +465,15 @@ export class Monitor extends EventEmitter {
   /* Called after a write action so its effect appears without a full poll wait. */
   refreshSoon(nodeId) {
     this.#monitors.get(nodeId)?.pollSoon();
+  }
+
+  /* Called after a HuggingFace write so the cache listing is re-read promptly. */
+  refreshHf(nodeId) {
+    this.#monitors.get(nodeId)?.markHfStale();
+  }
+
+  hfFor(nodeId) {
+    return this.#monitors.get(nodeId)?.hf ?? null;
   }
 
   snapshot() {

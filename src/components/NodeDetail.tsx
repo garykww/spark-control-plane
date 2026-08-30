@@ -15,6 +15,7 @@ import {
 } from '../lib/format';
 import { Badge, Button, Card, CoreGrid, StatTile, StatusDot } from './ui';
 import { ContainersPanel } from './ContainersPanel';
+import { HuggingFacePanel } from './HuggingFacePanel';
 import { SmStatus } from './SmStatus';
 import { Dial } from './viz/Dial';
 import { LineChart } from './viz/LineChart';
@@ -318,6 +319,8 @@ export function NodeDetail({ node, config, history, onEdit, onPower, onNotice }:
       )}
 
       <ContainersPanel node={node} onResult={onNotice} />
+
+      <HuggingFacePanel node={node} onResult={onNotice} />
 
       <div className="grid gap-4 xl:grid-cols-2">
         {/* GPU processes */}
