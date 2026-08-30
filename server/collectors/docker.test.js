@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseContainers, CONTAINER_ID_RE } from './docker.js';
+import { parseContainers, parseImages, CONTAINER_ID_RE } from './docker.js';
 
 const ID_A = 'a'.repeat(64);
 const ID_B = 'b'.repeat(64);
@@ -99,4 +99,20 @@ test('CONTAINER_ID_RE accepts docker ids and rejects anything shell-unsafe', () 
   for (const bad of ['', 'short', 'ABCDEF123456', 'a1b2c3d4e5f6; rm -rf /', '$(whoami)', '../etc']) {
     assert.equal(CONTAINER_ID_RE.test(bad), false, `expected "${bad}" to be rejected`);
   }
+});
+
+/* The run planner reads this to answer whether a recipe still has an image to
+ * pull, so an untagged layer must not be mistaken for something runnable. */
+test('parseImages keeps runnable tags and drops untagged layers', () => {
+  const images = parseImages(
+    ['vllm/vllm-openai:v0.28.0-aarch64', '<none>:<none>', 'ghcr.io/spark-arena/dgx-vllm:latest', 'myimage:<none>'].join('\n'),
+  );
+
+  assert.deepEqual(images, ['vllm/vllm-openai:v0.28.0-aarch64', 'ghcr.io/spark-arena/dgx-vllm:latest']);
+});
+
+test('parseImages de-duplicates and survives empty output', () => {
+  assert.deepEqual(parseImages('ubuntu:24.04\n\nubuntu:24.04\n'), ['ubuntu:24.04']);
+  assert.deepEqual(parseImages(''), []);
+  assert.deepEqual(parseImages(null), []);
 });

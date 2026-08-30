@@ -11,6 +11,10 @@
 
 export const DOCKER_COMMANDS = {
   docker: "docker ps --all --no-trunc --format '{{json .}}' 2>&1",
+  /* Local image tags, which is how the run planner knows whether a recipe still
+   * has an image to pull. Reads local metadata only - no registry round trip -
+   * so it costs about as little as `docker ps`. */
+  dockerImages: "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null",
 };
 
 /* Docker IDs are hex. Anything else never reaches a command line. */
@@ -91,6 +95,21 @@ export function parseContainers(text) {
   });
 
   return { containers, error: null, available: true };
+}
+
+/*
+ * Image tags as `repository:tag`. Untagged layers report "<none>" for either
+ * half and are dropped: nothing can be run by that name, so listing them would
+ * only make the planner's "already pulled" answer wrong.
+ */
+export function parseImages(text) {
+  const refs = new Set();
+  for (const line of String(text ?? '').split('\n')) {
+    const ref = line.trim();
+    if (!ref || ref.includes('<none>')) continue;
+    refs.add(ref);
+  }
+  return [...refs];
 }
 
 function describeProblem(message) {

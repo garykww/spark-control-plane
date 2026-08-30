@@ -25,6 +25,8 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY server ./server
+# The run planner's catalogue. Mount over it, or set RECIPES_FILE, to use your own.
+COPY recipes.yaml ./recipes.yaml
 COPY --from=build /app/dist ./dist
 
 # Node config and encrypted secrets live here; mount a volume to persist them.

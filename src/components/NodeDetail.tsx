@@ -1,4 +1,4 @@
-import type { History, NodeConfig, NodeSnapshot } from '../lib/types';
+import type { History, NodeConfig, NodeSnapshot, Recipe } from '../lib/types';
 import {
   bytes,
   bytesPerSecond,
@@ -16,6 +16,7 @@ import {
 import { Badge, Button, Card, CoreGrid, StatTile, StatusDot } from './ui';
 import { ContainersPanel } from './ContainersPanel';
 import { HuggingFacePanel } from './HuggingFacePanel';
+import { RunPlannerPanel } from './RunPlannerPanel';
 import { SmStatus } from './SmStatus';
 import { Dial } from './viz/Dial';
 import { LineChart } from './viz/LineChart';
@@ -26,12 +27,23 @@ interface Props {
   node: NodeSnapshot;
   config?: NodeConfig;
   history?: History;
+  recipes: Recipe[];
+  recipesError: string | null;
   onEdit: () => void;
   onPower: (action: 'shutdown' | 'reboot' | 'wake') => void;
   onNotice: (message: string) => void;
 }
 
-export function NodeDetail({ node, config, history, onEdit, onPower, onNotice }: Props) {
+export function NodeDetail({
+  node,
+  config,
+  history,
+  recipes,
+  recipesError,
+  onEdit,
+  onPower,
+  onNotice,
+}: Props) {
   const gpu = node.gpus[0];
 
   /*
@@ -317,6 +329,8 @@ export function NodeDetail({ node, config, history, onEdit, onPower, onNotice }:
           )}
         </Card>
       )}
+
+      <RunPlannerPanel node={node} recipes={recipes} error={recipesError} onResult={onNotice} />
 
       <ContainersPanel node={node} onResult={onNotice} />
 

@@ -179,6 +179,73 @@ body {
   background: transparent;
 }
 
+/*
+ * Range inputs, for the run planner's context / concurrency / memory knobs.
+ * Range styling has to go through vendor pseudo-elements, which utility
+ * classes cannot reach, so the whole control lives here.
+ *
+ * The track is drawn as a gradient by the component - filled to the left of the
+ * thumb, recessive to the right - so the slider shows how far along its range
+ * it sits without needing a second element behind it.
+ */
+.slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 16px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--slider-track, var(--surface-2));
+}
+
+.slider::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--slider-track, var(--surface-2));
+}
+
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px;
+  height: 13px;
+  /* Centres a 13px thumb on a 4px track. */
+  margin-top: -4.5px;
+  border-radius: 999px;
+  background: var(--series-power);
+  /* A surface ring so the thumb stays legible where it overlaps the fill. */
+  border: 2px solid var(--surface-1);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+}
+
+.slider::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--surface-1);
+  border-radius: 999px;
+  background: var(--series-power);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+}
+
+.slider:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid var(--series-power);
+  outline-offset: 2px;
+}
+
+.slider:focus-visible::-moz-range-thumb {
+  outline: 2px solid var(--series-power);
+  outline-offset: 2px;
+}
+
+.slider:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

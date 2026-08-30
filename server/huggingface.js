@@ -4,6 +4,7 @@ import {
   HF_RESOLVE,
   HF_HUB,
   HF_JOBS_DIR,
+  HF_DRY_RUN_TOTAL,
   REPO_ID_RE,
   REPO_TYPES,
   cacheFolderName,
@@ -125,19 +126,8 @@ fi
 
 # Total size first, so the UI can show a real percentage. Best effort: if this
 # fails the file holds 0 and the UI shows an indeterminate bar instead.
-"$HF" download ${target} --dry-run --format json 2>/dev/null | python3 -c '
-import json, re, sys
-MULT = {"K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15}
-total = 0
-try:
-    for entry in json.load(sys.stdin):
-        m = re.match(r"^([0-9.]+)\\s*([KMGTP])?$", str(entry.get("size", "")).strip())
-        if m:
-            total += float(m.group(1)) * (MULT[m.group(2)] if m.group(2) else 1)
-except Exception:
-    pass
-print(int(total))
-' > "$D/total" 2>/dev/null || echo 0 > "$D/total"
+"$HF" download ${target} --dry-run --format json 2>/dev/null \
+  | ${HF_DRY_RUN_TOTAL} > "$D/total" 2>/dev/null || echo 0 > "$D/total"
 
 "$HF" download ${target} --max-workers 8 >> "$D/log" 2>&1
 c=$?

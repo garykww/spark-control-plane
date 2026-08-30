@@ -7,6 +7,7 @@ import { config } from './config.js';
 import { api } from './routes/api.js';
 import { registry, seedLocalNodeIfEmpty } from './registry.js';
 import { monitor } from './monitor.js';
+import { publicRecipes, RECIPES_ERROR } from './recipes.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -47,6 +48,10 @@ wss.on('connection', (socket) => {
       historyLength: config.historyLength,
     },
     nodes: registry.listPublic(),
+    /* Static for the life of the process, so it ships once per connection
+     * rather than riding every snapshot push. */
+    recipes: publicRecipes(),
+    recipesError: RECIPES_ERROR,
     snapshot: monitor.snapshot(),
     history: monitor.allHistory(),
   });
@@ -93,6 +98,7 @@ server.listen(config.port, config.bindHost, () => {
   const nodeCount = registry.list().length;
   console.log(`[server] listening on http://${config.bindHost}:${config.port}`);
   console.log(`[server] monitoring ${nodeCount} node${nodeCount === 1 ? '' : 's'}${config.demoMode ? ' (demo mode)' : ''}`);
+  if (RECIPES_ERROR) console.warn(`[server] run planner disabled - ${RECIPES_ERROR}`);
   if (config.bindHost === '127.0.0.1') {
     console.log('[server] bound to loopback - set BIND_HOST=0.0.0.0 to reach it from the LAN');
   }

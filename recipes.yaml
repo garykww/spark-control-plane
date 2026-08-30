@@ -1,0 +1,145 @@
+# Serving recipes for the run planner.
+#
+# A recipe is a WHOLE serving configuration - weights, image and every vLLM flag
+# - not a template with blanks. The tuning is interdependent: DFlash2 needs a
+# target with an unquantised lm_head, GDN layers only work under one mamba cache
+# mode, and FP8 KV needs calibration scales that some exports ship and others do
+# not. Offering these as independent dropdowns would mostly produce combinations
+# that fail several minutes into a weight load, so a recipe is picked whole.
+#
+# The catalogue below is the port of serve-qwen38-27b-vllm-tuned.sh.
+#
+# Edit this file and restart the server. Every recipe is validated on load: a
+# bad one is reported by name and the whole catalogue is refused rather than
+# half-applied, so the planner never offers something it cannot run.
+#
+# ---------------------------------------------------------------------------
+# MEMORY, AND WHY --gpu-memory-utilization IS NOT SET HERE
+#
+# vLLM does not allocate what the model needs. It claims
+# gpu-memory-utilization x TOTAL memory as one block at startup, loads the
+# weights into it, and gives the entire remainder to the KV cache - which is
+# never resized afterwards. So the fraction is not a memory requirement, it is a
+# policy: "how much of this machine is vLLM's".
+#
+# The planner therefore computes the SMALLEST fraction that fits, from the
+# context length and concurrency actually being asked for, and passes that. A
+# recipe does not set --gpu-memory-utilization at all; the UI can raise it above
+# the minimum when you want a deeper prefix cache, and refuses to lower it below
+# the point where the KV cache no longer fits.
+#
+# The measured breakdown this arithmetic is built on, read out of a real
+# vLLM 0.28.0 startup on a DGX Spark running the nvfp4-dflash2 recipe:
+#
+#   Desired GPU memory utilization is (0.92, 111.95 GiB)
+#     28.16 GiB  weights + non-torch   (model load alone: 25.43 GiB)
+#      3.07 GiB  peak activation
+#      1.81 GiB  CUDAGraph memory
+#     80.73 GiB  KV cache -> 1,933,714 tokens, 7.38x concurrency at 262,144
+#
+# That gives 80.73 GiB / 1,933,714 = 44,827 bytes per token, and a fixed
+# overhead of 2.73 + 3.07 + 1.81 = 7.61 GiB (8.2 GB) beyond the weights.
+#
+# Two things about that per-token figure. It is a property of the ARCHITECTURE
+# and the KV dtype, not of the weight quantisation, so any other fp8-KV recipe
+# on this model shares it. And it is large because --mamba-cache-mode align forces
+# the attention page to match the mamba page: vLLM logged "Setting attention
+# block size to 880 tokens", so even a short request occupies a 880-token block
+# and the hybrid layer padding wastes up to 25% on top.
+#
+# ---------------------------------------------------------------------------
+# FIELDS
+#
+#   id            lowercase kebab-case, unique, stable (it is the API key)
+#   name/summary  what the panel shows
+#   model         repo: the Hub id served
+#                 sizeGB: on-disk size in decimal GB
+#                 measured: true if sizeGB was read off a real cache, false if
+#                   it was derived from the parameter count (the UI labels it)
+#   draft         optional speculative drafter, same shape as model
+#   servedName    optional; defaults to model.repo, like the script's SERVED_NAME
+#   image.ref     the image to run
+#   image.build   optional; when present the run BUILDS this tag instead of
+#                 pulling it - `from:` plus a list of `run:` steps
+#   container     docker container name; the run replaces its own, never another
+#   port          host port published to 0.0.0.0
+#   overheadGB    everything that is neither weights nor KV cache: non-torch
+#                 allocations, peak activation and CUDA graph capture. Roughly
+#                 constant per model at a given --max-num-batched-tokens.
+#   kvBytesPerToken  KV cache cost of one token, used to size the pool from the
+#                 context length and concurrency the user picks
+#   kvMeasured    true if that rate came off a real startup log, false if it is
+#                 an estimate (the UI labels it)
+#   args          vLLM flags as a map. A bare flag is `true`; everything else
+#                 becomes its value. The model id is passed positionally from
+#                 model.repo, so it is not repeated here.
+#                 --max-model-len and --max-num-seqs here are DEFAULTS: they are
+#                 what the panel starts on, and the user can change both per run.
+#                 Do not set --gpu-memory-utilization; it is computed.
+#   notes         shown under the recipe in the panel
+#
+# Values containing { } " : must be quoted, or YAML reads them as structure -
+# every --speculative-config below is quoted for exactly that reason.
+# ---------------------------------------------------------------------------
+#
+# WEIGHT SIZES. Both exports this recipe uses were cached on the Spark it was
+# built against, and are measured - read from `hf cache ls` on 2026-08-30:
+#
+#   RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead   23.8 GB
+#   incoai/Qwen3.8-27B-DFlash2                3.8 GB
+#
+# vLLM logged 25.43 GiB to load the pair, against 25.70 GiB of files, so on-disk
+# size is a good proxy for what the weights cost in memory. A recipe whose size
+# is derived from a parameter count instead should set `measured: false`, and
+# the panel will label the figure as an estimate.
+
+- id: qwen38-27b-nvfp4-dflash2
+  name: Qwen3.8-27B · NVFP4 + DFlash2
+  summary: >-
+    Lowest single-stream latency. Measured on a Spark at 45.6 tok/s on code with
+    an acceptance length of 4.70.
+  model:
+    repo: RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
+    sizeGB: 23.8
+    measured: true
+  draft:
+    repo: incoai/Qwen3.8-27B-DFlash2
+    sizeGB: 3.8
+    measured: true
+  image:
+    ref: vllm/vllm-openai:v0.28.0-aarch64
+  container: spark-run-qwen38-nvfp4-dflash2
+  port: 8000
+  # Measured: 2.73 non-torch + 3.07 activation + 1.81 CUDA graphs = 7.61 GiB.
+  overheadGB: 8.2
+  # Measured: 80.73 GiB of pool over 1,933,714 tokens, fp8 KV with align mode.
+  kvBytesPerToken: 44827
+  kvMeasured: true
+  args:
+    --tensor-parallel-size: 1
+    --distributed-executor-backend: mp
+    --trust-remote-code: true
+    --enable-prefix-caching: true
+    --enable-chunked-prefill: true
+    --attention-backend: FLASHINFER
+    --mamba-ssm-cache-dtype: bfloat16
+    --mamba-cache-mode: align
+    --max-model-len: 262144
+    --max-num-seqs: 1
+    --max-num-batched-tokens: 8192
+    --kv-cache-dtype: fp8
+    # k caps at 7: the drafter's dflash_config.block_size is 8.
+    --speculative-config: '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'
+    --enable-auto-tool-choice: true
+    --tool-call-parser: qwen3_coder
+    --reasoning-parser: qwen3
+  notes:
+    - >-
+      Wins single-stream only. DFlash2 crosses over at concurrency 2, above
+      which 4-bit + MTP is faster.
+    - >-
+      Needs an unquantised lm_head. This export keeps a dense BF16 head, which
+      is why it works where other 4-bit exports are refused.
+    - >-
+      Check the startup log says "DFlash2DraftModel": a DFlash2 checkpoint on a
+      runtime older than 0.27.1 silently drafts as DFlash1.

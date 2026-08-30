@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { HistoryMap, NodeConfig, Snapshot } from '../lib/types';
+import type { HistoryMap, NodeConfig, Recipe, Snapshot } from '../lib/types';
 import { api } from '../lib/api';
 
 export type ConnectionState = 'connecting' | 'live' | 'reconnecting' | 'offline';
@@ -9,6 +9,11 @@ interface DashboardState {
   snapshot: Snapshot | null;
   nodes: NodeConfig[];
   history: HistoryMap;
+  /* The recipe catalogue is fixed for the life of the server, so it ships with
+   * the init frame rather than riding every snapshot push. */
+  recipes: Recipe[];
+  /* Set when the recipe file could not be read or is invalid. */
+  recipesError: string | null;
   demoMode: boolean;
 }
 
@@ -53,6 +58,8 @@ export function useDashboard(historyLength = 300) {
     snapshot: null,
     nodes: [],
     history: {},
+    recipes: [],
+    recipesError: null,
     demoMode: false,
   });
 
@@ -92,6 +99,8 @@ export function useDashboard(historyLength = 300) {
             snapshot: payload.snapshot,
             nodes: payload.nodes,
             history: payload.history,
+            recipes: payload.recipes ?? [],
+            recipesError: payload.recipesError ?? null,
             demoMode: payload.config.demoMode,
           }));
           return;

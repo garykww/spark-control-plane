@@ -161,6 +161,9 @@ export function demoSnapshot(node, index = 0) {
     ],
     dockerAvailable: true,
     dockerError: null,
+    /* Deliberately excludes the recipes' vLLM image, so demo mode shows the
+     * planner's "will be pulled" path rather than only the happy one. */
+    dockerImages: ['nvcr.io/nvidia/tritonserver:25.06-py3', 'nvcr.io/nvidia/pytorch:25.06-py3'],
     hf: {
       available: true,
       error: null,
