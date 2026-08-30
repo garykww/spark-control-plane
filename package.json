@@ -14,7 +14,7 @@
     "build": "tsc --noEmit && vite build",
     "start": "NODE_ENV=production node server/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --test \"server/**/*.test.js\""
+    "test": "find server -name '*.test.js' -print0 | xargs -0 node --test"
   },
   "dependencies": {
     "express": "^5.1.0",
