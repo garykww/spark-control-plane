@@ -11,7 +11,7 @@ import {
   parsePmon,
   parseSmCount,
 } from './collectors/gpu.js';
-import { DOCKER_COMMANDS, parseContainers } from './collectors/docker.js';
+import { DOCKER_COMMANDS, parseContainers, parseImages } from './collectors/docker.js';
 import {
   HF_PROBE_COMMAND,
   HF_CACHE_COMMANDS,
@@ -25,6 +25,8 @@ import {
   parseJobs,
   summariseHf,
 } from './collectors/huggingface.js';
+import { PLANNER_COMMANDS, EMPTY_PLANNER, parseRuns } from './collectors/planner.js';
+import { buildPlanner } from './recipes.js';
 import { probeLlmEndpoints } from './collectors/llm.js';
 import { demoSnapshot } from './collectors/demo.js';
 import { specForNode } from './collectors/specs.js';
@@ -86,7 +88,9 @@ class NodeMonitor {
       gpus: [],
       gpuProcesses: [],
       hf: EMPTY_HF,
+      planner: EMPTY_PLANNER,
       containers: [],
+      dockerImages: [],
       dockerAvailable: false,
       dockerError: null,
       storage: [],
@@ -179,13 +183,17 @@ class NodeMonitor {
 
   #finishDemo(node) {
     const index = registry.list().findIndex((n) => n.id === node.id);
-    return {
+    const snapshot = {
       nodeId: node.id,
       name: node.name,
       type: node.type,
       spec: specForNode(node),
       ...demoSnapshot(node, Math.max(0, index)),
     };
+    /* Planned against the synthetic figures, so demo mode shows real fit
+     * arithmetic rather than a panel full of placeholders. */
+    snapshot.planner = buildPlanner(snapshot, []);
+    return snapshot;
   }
 
   async #collect(node) {
@@ -195,7 +203,12 @@ class NodeMonitor {
     /* The HuggingFace collection runs alongside the metrics batch rather than
      * after it, so its latency overlaps instead of adding to the poll. */
     const [sections, llmProbes] = await Promise.all([
-      runBatch(this.runner, { ...SYSTEM_COMMANDS, ...GPU_COMMANDS, ...DOCKER_COMMANDS }),
+      runBatch(this.runner, {
+        ...SYSTEM_COMMANDS,
+        ...GPU_COMMANDS,
+        ...DOCKER_COMMANDS,
+        ...PLANNER_COMMANDS,
+      }),
       probeLlmEndpoints(
         (node.llmPorts ?? []).map((p) => ({ host: node.host, port: p.port, label: p.label })),
       ),
@@ -207,6 +220,7 @@ class NodeMonitor {
     const gpus = parseGpus(sections.gpu || '', { isUnified });
     for (const gpu of gpus) gpu.smCount = this.smCount;
     const docker = parseContainers(sections.docker || '');
+    const runs = parseRuns(sections.runs || '');
 
     const now = Date.now();
     const elapsedSeconds = this.previous ? (now - this.previous.at) / 1000 : 0;
@@ -232,6 +246,7 @@ class NodeMonitor {
       gpuProcesses: this.#mergeProcesses(sections),
       hf: this.hf,
       containers: docker.containers,
+      dockerImages: parseImages(sections.dockerImages || ''),
       dockerAvailable: docker.available,
       dockerError: docker.error,
       thermal: system.thermal,
@@ -239,6 +254,14 @@ class NodeMonitor {
       network: this.#deriveNetwork(system, elapsedSeconds),
       llm: this.#deriveLlm(llmProbes, elapsedSeconds),
     };
+
+    /*
+     * Whether each recipe fits is read off the snapshot that was just built -
+     * memory, cache contents, free disk and published ports all come from it -
+     * so the plan a browser sees is always consistent with the numbers beside
+     * it, rather than being recomputed against a later reading in the UI.
+     */
+    snapshot.planner = buildPlanner(snapshot, runs);
 
     /* Baseline for the next poll's rate calculations. */
     this.previous = {
@@ -474,6 +497,12 @@ export class Monitor extends EventEmitter {
 
   hfFor(nodeId) {
     return this.#monitors.get(nodeId)?.hf ?? null;
+  }
+
+  /* The latest snapshot for one node, which is what the run routes plan
+   * against: refusing a recipe needs the same figures the UI was shown. */
+  snapshotFor(nodeId) {
+    return this.#monitors.get(nodeId)?.snapshot ?? null;
   }
 
   snapshot() {

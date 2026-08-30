@@ -81,6 +81,29 @@ export const HF_JOB_COMMANDS = {
     'done',
 };
 
+/*
+ * Sums a `hf download --dry-run --format json` listing into bytes. Reads the
+ * listing on stdin and prints one integer, or 0 if anything about it surprises
+ * it - a wrong total costs a progress bar, and must never cost the download.
+ *
+ * Shared by the download job and the run planner: both need a total before they
+ * can show a percentage, and a dry run against a large repo can take longer
+ * than the launch budget, so both compute it on the node after detaching.
+ */
+export const HF_DRY_RUN_TOTAL = `python3 -c '
+import json, re, sys
+MULT = {"K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15}
+total = 0
+try:
+    for entry in json.load(sys.stdin):
+        m = re.match(r"^([0-9.]+)\\s*([KMGTP])?$", str(entry.get("size", "")).strip())
+        if m:
+            total += float(m.group(1)) * (MULT[m.group(2)] if m.group(2) else 1)
+except Exception:
+    pass
+print(int(total))
+'`;
+
 /* Repo ids are one or two segments of word characters, dots and dashes. */
 export const REPO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,95})?$/;
 export const REPO_TYPES = ['model', 'dataset', 'space'];

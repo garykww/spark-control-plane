@@ -17,6 +17,8 @@ import {
   reclaim,
 } from '../huggingface.js';
 import { ACTIVE_STATUSES } from '../collectors/huggingface.js';
+import { startRun, cancelRun, stopRun, clearRun } from '../planner.js';
+import { publicRecipes, recipeById, planRecipe, RECIPES_ERROR } from '../recipes.js';
 import { DGX_SPARK_SPEC } from '../collectors/specs.js';
 
 export const api = express.Router();
@@ -209,6 +211,98 @@ api.post('/nodes/:id/hf/reclaim', route(async (req, res) => {
   const result = await reclaim(node, target);
   monitor.refreshHf(req.params.id);
   res.json(result);
+}));
+
+/*
+ * Run planner. A recipe is a whole serving configuration; starting one fetches
+ * the weights, gets the image and launches the container, which takes hours the
+ * first time. Like a HuggingFace download it runs detached on the node, so this
+ * route returns once the sequence is under way, not when the model is serving.
+ */
+api.get('/recipes', (req, res) => {
+  /* An unreadable or invalid recipe file is reported rather than looking like
+   * an empty catalogue - the person who just edited it needs to see why. */
+  res.json({ recipes: publicRecipes(), error: RECIPES_ERROR });
+});
+
+/* Reads the tuning knobs off a request body. Every one is optional; the plan
+ * falls back to the recipe's own defaults for whatever is missing. */
+const tuningFrom = (body) => ({
+  contextLength: body?.contextLength,
+  maxRequests: body?.maxRequests,
+  gpuMemoryUtilization: body?.gpuMemoryUtilization,
+});
+
+/*
+ * Prices one recipe at a given context length and concurrency.
+ *
+ * The panel calls this as the knobs move, rather than doing the arithmetic
+ * itself, so there is exactly one implementation of it and the figure shown is
+ * by construction the figure the launch route will enforce.
+ */
+api.post('/nodes/:id/plan', route(async (req, res) => {
+  requireNode(req);
+  const recipe = recipeById(req.body?.recipeId);
+
+  const snapshot = monitor.snapshotFor(req.params.id);
+  if (!snapshot) throw new ValidationError('this node has not been polled yet');
+
+  res.json({
+    plan: planRecipe(recipe, snapshot, snapshot.planner?.runs ?? [], tuningFrom(req.body)),
+  });
+}));
+
+api.post('/nodes/:id/runs', route(async (req, res) => {
+  const node = requireNode(req);
+  const recipe = recipeById(req.body?.recipeId);
+
+  /*
+   * Planned again here rather than trusting the browser's answer. The check is
+   * cheap and the alternative is expensive: a recipe that does not fit spends
+   * an hour downloading weights before vLLM refuses to start. It runs against
+   * the monitor's latest snapshot, which is the same one the UI was rendering.
+   */
+  const snapshot = monitor.snapshotFor(req.params.id);
+  if (!snapshot) throw new ValidationError('this node has not been polled yet');
+
+  const plan = planRecipe(recipe, snapshot, snapshot.planner?.runs ?? [], tuningFrom(req.body));
+  if (!plan.fits) {
+    throw new ValidationError(`${recipe.name} cannot run on ${node.name}: ${plan.blockers[0].message}`);
+  }
+
+  /* The plan's own resolved tuning, not the request body: the memory fraction
+   * is computed against a live reading and is not a caller's to assert. */
+  const result = await startRun(node, {
+    recipeId: recipe.id,
+    port: req.body?.port,
+    tuning: plan.tuning,
+  });
+  monitor.refreshSoon(req.params.id);
+  res.status(201).json(result);
+}));
+
+/* Stops the sequence wherever it has got to, and removes the container if one
+ * was already started. */
+api.post('/nodes/:id/runs/:runId/cancel', route(async (req, res) => {
+  const node = requireNode(req);
+  const result = await cancelRun(node, req.params.runId);
+  monitor.refreshSoon(req.params.id);
+  res.json(result);
+}));
+
+/* Stops the server a finished run left behind; the run itself is already over. */
+api.post('/nodes/:id/runs/:runId/stop', route(async (req, res) => {
+  const node = requireNode(req);
+  const result = await stopRun(node, req.params.runId);
+  monitor.refreshSoon(req.params.id);
+  res.json(result);
+}));
+
+api.delete('/nodes/:id/runs/:runId', route(async (req, res) => {
+  const node = requireNode(req);
+  await clearRun(node, req.params.runId);
+  monitor.refreshSoon(req.params.id);
+  res.status(204).end();
 }));
 
 api.get('/snapshot', (req, res) => {

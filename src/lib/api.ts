@@ -1,4 +1,12 @@
-import type { ContainerAction, HfDeletePreview, HfRepoType, NodeConfig, TestResult } from './types';
+import type {
+  ContainerAction,
+  HfDeletePreview,
+  HfRepoType,
+  NodeConfig,
+  Recipe,
+  RecipePlan,
+  TestResult,
+} from './types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
@@ -31,6 +39,14 @@ export interface NodeInput {
   macAddress: string | null;
   enabled: boolean;
   password?: string;
+}
+
+/* The knobs a run can be tuned with. Every one is optional; the server falls
+ * back to the recipe's own defaults for whatever is missing. */
+export interface RunTuning {
+  contextLength?: number;
+  maxRequests?: number;
+  gpuMemoryUtilization?: number | null;
 }
 
 export const api = {
@@ -81,6 +97,34 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+
+  /* Prices a recipe at a given context and concurrency. The panel asks the
+   * server rather than doing the arithmetic itself, so the figure it shows is
+   * by construction the one the launch route will enforce. */
+  planRun: (nodeId: string, body: RunTuning & { recipeId: string }) =>
+    request<{ plan: RecipePlan }>(`/nodes/${nodeId}/plan`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }).then((r) => r.plan),
+
+  listRecipes: () => request<{ recipes: Recipe[] }>('/recipes').then((r) => r.recipes),
+
+  /* Returns once the sequence is under way on the node, not when the model is
+   * serving - the first run of a recipe downloads tens of gigabytes. */
+  startRun: (nodeId: string, body: RunTuning & { recipeId: string; port?: number }) =>
+    request<{ ok: boolean; runId: string; apiKey: string; port: number }>(`/nodes/${nodeId}/runs`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  cancelRun: (nodeId: string, runId: string) =>
+    request<{ ok: boolean }>(`/nodes/${nodeId}/runs/${runId}/cancel`, { method: 'POST' }),
+
+  stopRun: (nodeId: string, runId: string) =>
+    request<{ ok: boolean }>(`/nodes/${nodeId}/runs/${runId}/stop`, { method: 'POST' }),
+
+  clearRun: (nodeId: string, runId: string) =>
+    request<void>(`/nodes/${nodeId}/runs/${runId}`, { method: 'DELETE' }),
 
   hfReclaim: (nodeId: string, target: 'incomplete' | 'prune') =>
     request<{ ok: boolean; files?: number; revisions?: number; freedBytes: number | null }>(

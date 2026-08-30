@@ -17,6 +17,7 @@ Each node gets a summary card on the Overview tab and a full page of its own:
 - **Storage and network** — per-mount capacity, per-interface throughput
 - **Inference** — auto-detects vLLM, llama.cpp, SGLang, TGI, and Ollama, then tracks decode/prefill tokens per second, queue depth, and KV cache usage
 - **Containers** — every Docker container on the node, with start, stop, and restart buttons
+- **Model runs** — pick a serving recipe, tune its context and concurrency against the node's free memory, then let the dashboard fetch the weights, get the image, start the container and wait for it to serve
 - **HuggingFace cache** — cached models and datasets with sizes, plus download, delete, and space reclaim
 - **Thermals** — every thermal zone the kernel exposes
 
@@ -90,6 +91,7 @@ Every setting is an environment variable, and every one is optional. `.env.examp
 | `OFFLINE_THRESHOLD` | `3` | Failed polls before a node is shown as offline |
 | `SECRET_KEY` | generated | Encrypts stored SSH passwords |
 | `HF_CACHE_INTERVAL_MS` | `30000` | How often the HuggingFace cache is re-listed |
+| `RECIPES_FILE` | `./recipes.yaml` | The run planner's recipe catalogue |
 | `DEMO_MODE` | off | Serve synthetic metrics |
 
 Runtime state lives in `config/`: `nodes.json` holds the node list, `nodes-secrets.json` holds SSH passwords encrypted with AES-256-GCM, and `.secret-key` holds the generated key when you haven't set `SECRET_KEY`. All three are gitignored.
@@ -155,6 +157,83 @@ hf auth login     # on the node, for gated or private repos
 
 Sizes come from `hf` itself, which reports in decimal units (a repo `du` measures at 999,588,026 bytes is reported as `999.6M`). The dashboard displays binary units like it does for memory and disk, so a figure here can differ by a few percent from what the `hf` CLI prints.
 
+## Model runs
+
+The node detail page lists a set of **recipes** — whole serving configurations, not templates with blanks. Each one names its weights, its image and every vLLM flag it will serve with. Pick one that fits and press **Run this recipe**; the node then downloads the weights, pulls the image, starts the container, and waits until the served endpoint actually answers.
+
+The catalogue ships one recipe: **Qwen3.8-27B · NVFP4 + DFlash2**, the drafted 4-bit configuration from `serve-qwen38-27b-vllm-tuned.sh` — the one measured end to end on real hardware. Add your own by appending to the list.
+
+**Why whole recipes and not dropdowns.** The tuning is interdependent: DFlash2 needs a target with an unquantised `lm_head`, GDN layers only work under one specific mamba cache mode, and FP8 KV needs calibration scales the NVFP4 exports ship and the FP8 export doesn't. A screen of independent dropdowns would mostly produce combinations that fail at load, several minutes into a weight load.
+
+**Recipes live in `recipes.yaml`** at the repo root. Edit it and restart the server; set `RECIPES_FILE` to keep your own catalogue out of the tree. A recipe looks like this:
+
+```yaml
+- id: qwen38-27b-nvfp4-dflash2
+  name: Qwen3.8-27B · NVFP4 + DFlash2
+  summary: Lowest single-stream latency; 45.6 tok/s on code, acceptance length 4.70.
+  model:
+    repo: RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
+    sizeGB: 23.8
+    measured: true          # false means the size is an estimate, and the UI says so
+  draft:                    # optional speculative drafter
+    repo: incoai/Qwen3.8-27B-DFlash2
+    sizeGB: 3.8
+    measured: true
+  image:
+    ref: vllm/vllm-openai:v0.28.0-aarch64
+  container: spark-run-qwen38-nvfp4-dflash2
+  port: 8000
+  overheadGB: 8.2           # non-torch + activation + CUDA graphs, measured
+  kvBytesPerToken: 44827    # measured; sizes the pool from the settings below
+  kvMeasured: true          # false labels the estimate in the panel
+  args:                     # vLLM flags; a bare flag is `true`, `false` omits it
+    --max-model-len: 262144 # a DEFAULT — the panel lets you change it per run
+    --max-num-seqs: 1       # likewise
+    --kv-cache-dtype: fp8
+    --trust-remote-code: true
+    --speculative-config: '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'
+  notes:
+    - Shown under the recipe in the panel.
+```
+
+The model id is passed positionally and served under its own name, so it isn't repeated in `args`. `--max-model-len` and `--max-num-seqs` are read back out of the flags rather than declared twice, and act as the panel's starting values. Do **not** set `--gpu-memory-utilization` — the planner computes it, and a recipe that pins it is refused on load. Values containing `{ } " :` must be quoted or YAML reads them as structure.
+
+Every recipe is validated on load — ids, image references, container names, and every flag and value that will be interpolated into a command on the node. A bad recipe refuses the *whole* catalogue rather than being quietly dropped, and the reason appears both in the server log and in the panel itself. A broken recipe file never stops the dashboard from monitoring.
+
+**Context and concurrency are yours to set.** Each recipe ships defaults, and the panel lets you change the context length and the maximum number of concurrent requests before you run it. The memory estimate re-prices as you do — the panel posts the settings to the server and renders what comes back, so the figure on screen is by construction the one the launch route enforces rather than a second implementation of the same arithmetic.
+
+**`--gpu-memory-utilization` is computed, not fixed.** This is the part worth understanding, because vLLM's fraction is a policy rather than a requirement:
+
+> vLLM claims `utilization × total` memory as one block at startup, loads the weights into it, and gives the entire remainder to the KV cache — which is never resized afterwards. Measured on a Spark running the NVFP4 + DFlash2 recipe at `0.92`: 28.16 GiB weights and non-torch, 3.07 GiB peak activation, 1.81 GiB CUDA graphs, and **80.73 GiB of KV cache** — 71% of the reservation. That bought 1,933,714 tokens of pool, or 7.38 concurrent full-length requests, at `--max-num-seqs 1`.
+
+So the planner works out the *smallest* fraction that covers the context and concurrency you actually asked for, and passes that. The estimate bar shows both parts: a solid segment for what the settings require, and a hatched tail for whatever the fraction reserves beyond it — labelled with how many extra tokens of prefix cache that buys, since that is what the surplus becomes. In practice the same recipe that needed `0.92` (120 GB) runs at `0.37` (48 GB), which is the difference between owning the box and sharing it with whatever else is on it. You can override the fraction upward when you want a deeper prefix cache — the surplus above the minimum is exactly that — and the planner refuses an override *below* the minimum, where the pool could no longer hold one full-length request and vLLM would exit at startup.
+
+**What "fits" means.** The blocking checks:
+
+- **Memory** — weights + overhead + the KV cache your context and concurrency need, against the node's free memory. On a Spark that is the unified pool, since there is no separate VRAM; on a discrete GPU it is the card's own memory.
+- **vLLM's own startup check** — `utilization × total` against *free*. With an automatic minimum this is unreachable; it only bites when you override upward. It is the failure the reference script's comment records: on an idle Spark with 114.97 GiB free, `0.95` asks for 115.6 GiB and the server refuses, short by 0.63 GiB.
+- Free disk on the cache filesystem, a container already holding the port, a missing `hf` CLI or Docker daemon, and a run already in flight.
+
+**The figures behind the estimate** come from `recipes.yaml`, and each is labelled measured or estimated:
+
+- `model.sizeGB` — read off a real `hf cache ls`. vLLM logged 25.43 GiB to load a pair whose files total 25.70 GiB, so on-disk size is a good proxy for what weights cost in memory.
+- `overheadGB` — non-torch + peak activation + CUDA graph capture, 7.61 GiB measured.
+- `kvBytesPerToken` — 80.73 GiB over 1,933,714 tokens = 44,827 bytes. It is a property of the architecture and the KV dtype, not the weight quantisation, so every fp8-KV recipe on this model shares it. It is large because `--mamba-cache-mode align` forces the attention page to match the mamba page — vLLM logged an 880-token attention block — and hybrid layer padding wastes up to 25% on top.
+
+**The run itself.** Like a HuggingFace download, it runs *detached on the node*: closing the page, restarting the dashboard or dropping the SSH connection doesn't touch it. Progress arrives on the normal poll as a phase — Weights, Image, Container, Loading, Serving — with a byte count during the download, which is the only phase with a total to divide by. **Cancel** kills the whole sequence and removes any container it had already started; **Stop server** takes down a finished one.
+
+A run reaches "Serving" only after the endpoint answers a real request, not merely when the container starts. The generated API key is shown alongside the URL:
+
+```
+Authorization: Bearer sk-...
+```
+
+> **Warning**: the server is published on all interfaces, matching the reference script's default. On a trusted network that is what makes it reachable from your other machines; the API key is the only thing in front of it.
+
+**Building images.** Every bundled recipe names a published image and pulls it — building vLLM for aarch64 on the node would take hours and produce something less tested than the pinned image. A recipe that genuinely needs a derived image (a patched kernel, an extra wheel) can declare `image.build`, and the same phase writes a Dockerfile on the node and builds it instead.
+
+One run at a time per node: two recipes racing would fight over the same port, the same memory and possibly the same container name.
+
 ## Containers
 
 The node detail page lists every container `docker ps -a` reports, running ones first, and gives you **Start**, **Stop**, and **Restart** on each row. Stopping asks for confirmation first.
@@ -198,6 +277,7 @@ The tests cover the parsing and validation logic — `/proc` and `nvidia-smi` ou
 ### Layout
 
 ```
+recipes.yaml        the run planner's recipe catalogue
 server/
   index.js          HTTP + WebSocket entry point
   monitor.js        poll loop, rate derivation, snapshots
@@ -206,11 +286,13 @@ server/
   power.js          shutdown, reboot, Wake-on-LAN
   containers.js     docker start / stop / restart
   huggingface.js    model download / delete / reclaim
+  recipes.js        loads recipes.yaml; the memory / disk fit arithmetic
+  planner.js        run a recipe: download, image, launch, wait for ready
   collectors/       /proc + /sys, nvidia-smi, docker ps, hf cache, inference probes, demo data
   exec/             local and SSH command runners, batching
 src/
   App.tsx           shell, tabs, fleet summary
-  components/       node cards, detail panels, container list, model cache, add/edit dialog
+  components/       node cards, detail panels, container list, model cache, run planner, add/edit dialog
   components/viz/   sparkline, line chart, dial, meter
   hooks/            WebSocket state, element sizing
 ```

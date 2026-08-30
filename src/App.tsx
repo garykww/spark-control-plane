@@ -20,7 +20,8 @@ const CONNECTION_LABEL = {
 } as const;
 
 export default function App() {
-  const { connection, snapshot, nodes, history, demoMode, refreshNodes } = useDashboard();
+  const { connection, snapshot, nodes, history, recipes, recipesError, demoMode, refreshNodes } =
+    useDashboard();
   const [selected, setSelected] = useState<string>('overview');
   const [dialog, setDialog] = useState<{ open: boolean; node: NodeConfig | null }>({ open: false, node: null });
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem(THEME_KEY) as Theme) ?? 'dark');
@@ -182,6 +183,8 @@ export default function App() {
             node={active}
             config={configById.get(active.nodeId)}
             history={history[active.nodeId]}
+            recipes={recipes}
+            recipesError={recipesError}
             onEdit={() => setDialog({ open: true, node: configById.get(active.nodeId) ?? null })}
             onPower={(action) => handlePower(active.nodeId, action)}
             onNotice={setToast}

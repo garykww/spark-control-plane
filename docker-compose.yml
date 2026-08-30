@@ -12,6 +12,8 @@ services:
       - ./config:/app/config
       # SSH keys and known_hosts for remote collection.
       - ~/.ssh:/root/.ssh:ro
+      # Edit recipes without rebuilding; the server re-reads it on restart.
+      - ./recipes.yaml:/app/recipes.yaml:ro
     environment:
       PORT: 5555
       BIND_HOST: 0.0.0.0

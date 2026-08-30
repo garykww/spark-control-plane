@@ -16,6 +16,10 @@ export const config = {
   rootDir: path.resolve(here, '..'),
   configDir: process.env.CONFIG_DIR || path.resolve(here, '..', 'config'),
 
+  /* The run planner's recipe catalogue. Ships with the repo and is meant to be
+   * edited; point RECIPES_FILE elsewhere to keep local recipes out of the tree. */
+  recipesFile: process.env.RECIPES_FILE || path.resolve(here, '..', 'recipes.yaml'),
+
   /* How often each node is polled, and how often snapshots are pushed to browsers. */
   pollIntervalMs: int(process.env.POLL_INTERVAL_MS, 2000),
   pushIntervalMs: int(process.env.PUSH_INTERVAL_MS, 1000),

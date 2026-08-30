@@ -189,6 +189,113 @@ export interface HfDeletePreview {
   sizeBytes: number | null;
 }
 
+export type RunPhase = 'download' | 'image' | 'launch' | 'wait' | 'ready';
+
+export type RunStatus =
+  | 'starting'
+  | 'downloading'
+  | 'pulling'
+  | 'launching'
+  | 'waiting'
+  | 'ready'
+  | 'failed'
+  | 'cancelled'
+  | 'blocked'
+  | 'orphaned';
+
+/* A whole serving configuration - weights, image and every flag - rather than a
+ * template with blanks. Served once per connection; it never changes at runtime. */
+export interface Recipe {
+  id: string;
+  name: string;
+  summary: string;
+  modelRepoId: string;
+  draftRepoId: string | null;
+  imageRef: string;
+  buildsImage: boolean;
+  port: number;
+  containerName: string;
+  /* Read back out of the recipe's own flags; null when it left the choice to
+   * vLLM by not setting --max-model-len / --max-num-seqs. */
+  contextLength: number | null;
+  concurrency: number | null;
+  weightsBytes: number;
+  args: string[];
+  notes: string[];
+}
+
+export interface PlanIssue {
+  code: string;
+  message: string;
+}
+
+/* Recomputed on every poll against that poll's own figures, so what the panel
+ * shows and what the server will allow can never disagree. */
+export interface RecipePlan {
+  recipeId: string;
+  fits: boolean;
+  memory: {
+    unified: boolean;
+    weightsBytes: number;
+    /* Non-torch allocations, peak activation and CUDA graph capture. */
+    overheadBytes: number;
+    /* The term that moves with the tuning below. */
+    kvBytes: number;
+    kvTokens: number;
+    requiredBytes: number;
+    /* What vLLM will actually ask for: its utilisation fraction of total. */
+    claimBytes: number | null;
+    availableBytes: number | null;
+    totalBytes: number | null;
+  };
+  /* What this plan was priced at, and the room to move. */
+  tuning: {
+    contextLength: number;
+    maxRequests: number;
+    gpuMemoryUtilization: number | null;
+    /* The smallest fraction that still covers the settings above. */
+    minUtilization: number | null;
+    /* False once the user has pinned a fraction of their own. */
+    automatic: boolean;
+    contextOptions: number[];
+    requestOptions: number[];
+  };
+  disk: {
+    downloadBytes: number;
+    availableBytes: number | null;
+    mount: string | null;
+  };
+  repos: { repoId: string; repoType: HfRepoType; cached: boolean }[];
+  /* null when the node's image list has not been read yet. */
+  imagePresent: boolean | null;
+  blockers: PlanIssue[];
+  warnings: PlanIssue[];
+}
+
+export interface Run {
+  id: string;
+  recipeId: string;
+  recipeName: string;
+  modelRepoId: string;
+  containerName: string;
+  port: number | null;
+  apiKey: string | null;
+  phase: RunPhase | null;
+  status: RunStatus;
+  totalBytes: number | null;
+  downloadedBytes: number;
+  /* Only the download phase has a denominator; every other phase reports null. */
+  percent: number | null;
+  message: string | null;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+export interface PlannerState {
+  runs: Run[];
+  plans: RecipePlan[];
+}
+
 export interface SparkSpec {
   platform: string;
   soc: string;
@@ -236,10 +343,13 @@ export interface NodeSnapshot {
   gpus: Gpu[];
   gpuProcesses: GpuProcess[];
   containers: Container[];
+  /* Local image tags, so the planner knows what still has to be pulled. */
+  dockerImages: string[];
   /* False when Docker is absent or unreachable; dockerError says which. */
   dockerAvailable: boolean;
   dockerError: string | null;
   hf: HfState;
+  planner: PlannerState;
   thermal: ThermalZone[];
   storage: Mount[];
   network: Interface[];
