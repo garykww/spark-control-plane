@@ -7,7 +7,10 @@
 # not. Offering these as independent dropdowns would mostly produce combinations
 # that fail several minutes into a weight load, so a recipe is picked whole.
 #
-# The catalogue below is the port of serve-qwen38-27b-vllm-tuned.sh.
+# The catalogue below is the port of serve-qwen38-27b-vllm-tuned.sh,
+# serve-qwen36-35b-a3b-dflash.sh and run-comfyui-h3-spark.sh. Each recipe
+# carries the reasoning from the script it came from, and says which of that
+# script's knobs the planner now decides instead.
 #
 # Edit this file and restart the server. Every recipe is validated on load: a
 # bad one is reported by name and the whole catalogue is refused rather than
@@ -73,8 +76,15 @@
 #   args          vLLM flags as a map. A bare flag is `true`; everything else
 #                 becomes its value. The model id is passed positionally from
 #                 model.repo, so it is not repeated here.
-#                 --max-model-len and --max-num-seqs here are DEFAULTS: they are
-#                 what the panel starts on, and the user can change both per run.
+#                 --max-num-seqs here is a DEFAULT: the panel starts on it and
+#                 the user can raise or lower it per run, up to 64.
+#                 --max-model-len is a CEILING as well as the starting value.
+#                 The picker offers no context longer than it, and a longer one
+#                 asked for over the API is clamped down to it rather than
+#                 refused. So declare the model's NATIVE WINDOW here, never a
+#                 memory budget: the fraction is computed from whatever context
+#                 is actually picked, so a short value buys nothing and only
+#                 puts the longer contexts permanently out of reach.
 #                 Do not set --gpu-memory-utilization; it is computed.
 #   notes         shown under the recipe in the panel
 #
@@ -82,8 +92,8 @@
 # every --speculative-config below is quoted for exactly that reason.
 # ---------------------------------------------------------------------------
 #
-# WEIGHT SIZES. Both exports this recipe uses were cached on the Spark it was
-# built against, and are measured - read from `hf cache ls` on 2026-08-30:
+# WEIGHT SIZES. Both exports the recipe below uses were cached on the Spark it
+# was built against, and are measured - from `hf cache ls` on 2026-08-30:
 #
 #   RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead   23.8 GB
 #   incoai/Qwen3.8-27B-DFlash2                3.8 GB
@@ -143,6 +153,160 @@
     - >-
       Check the startup log says "DFlash2DraftModel": a DFlash2 checkpoint on a
       runtime older than 0.27.1 silently drafts as DFlash1.
+
+# ---------------------------------------------------------------------------
+# Ported from serve-qwen36-35b-a3b-dflash.sh.
+#
+# EVERY FIGURE BELOW IS TAKEN FROM THE NODE, NOT FROM THE SCRIPT. The script's
+# own sizing prose turned out to be badly wrong about this model, so weights
+# come from `du` over the cache blobs and the rest from its config.json, read
+# on nv-spark-01 on 2026-08-31 at revision e94a930.
+#
+#   text_config: 40 layers, of which layer_types says only 10 are
+#   full_attention (full_attention_interval 4) and 30 are linear_attention;
+#   num_key_value_heads 2, head_dim 256, max_position_embeddings 262144.
+#
+# That architecture is the whole story for memory: only the 10 full-attention
+# layers hold a per-token KV cache, and the 30 linear-attention layers keep a
+# fixed-size recurrent state per SEQUENCE that does not grow with context.
+#
+# WHAT DID NOT CARRY OVER from the script, and why:
+#
+#   GPU_MEM_UTIL=0.45   Computed, not declared - see the header. The script
+#                       picked 0.45 by hand to leave room for a second model.
+#                       With the real KV rate below the same settings price far
+#                       lower than that, so the fraction it hand-tuned was
+#                       sized against a cost this model does not have.
+#   max-model-len=32K   The model's native window is 262144. The script's 32K
+#                       was a memory budget, not a limit - see the flag below.
+#   SHM_SIZE=16g        The launcher gives every recipe --shm-size=32g. On
+#                       unified memory this tmpfs is a lazy cap and not a
+#                       reservation, which is the script's own reasoning for
+#                       treating 16g and --ipc=host as interchangeable, so the
+#                       larger cap costs nothing. `ipcHost: true` would switch
+#                       to --ipc=host if that is ever wanted.
+#   SKIP_PRESTAGE       The download phase is the pre-stage, and it is already
+#                       idempotent: `hf download` skips what is cached, so a
+#                       re-run of a cached recipe walks straight past it.
+#   The JIT warm-up     The script fires a 3-token request after readiness so
+#                       the first real one does not eat cold-start codegen. The
+#                       run stops at the readiness probe, so the FIRST
+#                       completion through this recipe still pays that cost.
+
+- id: qwen36-35b-a3b-nvfp4-dflash
+  name: Qwen3.6-35B-A3B · NVFP4 + DFlash
+  summary: >-
+    Agentic serving with a 0.5B block drafter, on the patched DGX Spark vLLM
+    build. A hybrid model - 30 of its 40 layers are linear attention - so its
+    KV cache is small and full 256K context is cheap.
+  model:
+    # Measured: du over the cache blobs on nv-spark-01, 2026-08-31.
+    repo: RedHatAI/Qwen3.6-35B-A3B-NVFP4
+    sizeGB: 25.1
+    measured: true
+  draft:
+    # Measured the same way. 6 layers, head_dim 128 - a small drafter, and its
+    # weights and KV both live INSIDE the fraction rather than beside it.
+    repo: z-lab/Qwen3.6-35B-A3B-DFlash
+    sizeGB: 0.8
+    measured: true
+  image:
+    # Untagged on purpose, as in the script: this is the patched DGX Spark
+    # nightly and there is no version to pin. `latest` therefore moves under
+    # you, and the image phase re-pulls it.
+    #
+    # The script prepends `vllm serve` because this image sets no ENTRYPOINT.
+    # That does NOT carry over: the launcher pins --entrypoint vllm and passes
+    # `serve` itself, which is what makes this image and vllm/vllm-openai take
+    # identical argv. Re-adding it here would produce `vllm serve vllm serve`.
+    ref: ghcr.io/spark-arena/dgx-vllm-eugr-nightly
+  container: spark-run-qwen36-a3b-dflash
+  port: 8000
+  # The one figure here still NOT taken from the node. Starting from the real
+  # breakdown of the 27B recipe - 2.73 non-torch + 3.07 activation + 1.81 CUDA
+  # graphs = 7.61 GiB - and doubling only the activation term, because this
+  # recipe runs --max-num-batched-tokens 16384 against that recipe's 8192 and
+  # the prefill working set is what scales with it: 2.73 + 6.14 + 1.81 = 10.7
+  # GiB, so 11 GB. Rounded up deliberately: overstating it only makes vLLM
+  # claim slightly more than it needs, while understating it leaves a pool too
+  # small to hold max-model-len and the server exits at startup. Now that the
+  # KV cache is small, this term dominates the plan - so it is the figure most
+  # worth replacing with a real startup log.
+  overheadGB: 11
+  # DERIVED FROM THE ARCHITECTURE, and cross-checked against the one measured
+  # KV rate in this file. Only the 10 full-attention layers cost per token:
+  #
+  #   10 layers x 2 (K and V) x 2 kv heads x 256 head_dim x 1 byte (fp8)
+  #     = 10,240 bytes per token, architecturally
+  #
+  # vLLM allocates in blocks, so the real rate is higher. The 27B recipe gives
+  # the correction factor, because its measured rate and its config are both
+  # known: 16 full-attn layers x 2 x 4 x 256 = 32,768 bytes architecturally
+  # against 44,827 measured, or 1.37x for block padding. Applying the same
+  # factor here gives 10,240 x 1.37 = 14,008.
+  #
+  # DO NOT restore the earlier 632,000 figure. It came from reading the
+  # script's "fp8 KV at GMU 0.85 gave a ~125K-token pool" as a real
+  # measurement, and it is 45x too high - impossible for an architecture with
+  # 2 KV heads across 10 attention layers, whatever the padding. That single
+  # bad number is what made 32K look expensive and 256K look unreachable.
+  kvBytesPerToken: 14008
+  kvMeasured: false
+  args:
+    --trust-remote-code: true
+    --enable-prefix-caching: true
+    --enable-chunked-prefill: true
+    # The model's native window, straight out of config.json
+    # (max_position_embeddings 262144) - NOT the script's 32768.
+    #
+    # The script's 32K was a consequence of pinning GPU_MEM_UTIL=0.45 to share
+    # the box, sized against a KV cost this model does not have. Here the
+    # fraction is computed FROM the context, and this field is a CEILING as
+    # well as the starting value, so a memory budget written here would put the
+    # model's real reach permanently out of the picker's range. Declare the
+    # window; let the planner price whatever context is chosen.
+    --max-model-len: 262144
+    # 2 streams, the script's own choice, and this part of its reasoning does
+    # survive the port: it stays under the Spark's bandwidth ceiling, above
+    # which decode streams spike TTFT. Unlike the context above this is only a
+    # starting value, not a cap - the panel offers up to 64.
+    --max-num-seqs: 2
+    --max-num-batched-tokens: 16384
+    # fp8 roughly halves the bytes per token. This checkpoint ships no KV
+    # scaling factors, so they are computed during prefill rather than falling
+    # back to scale=1.0, which risks overflow.
+    --kv-cache-dtype: fp8
+    --calculate-kv-scales: true
+    # GPUDirect Storage accelerated weight loading, for a faster cold start.
+    --load-format: fastsafetensors
+    # k=15 is z-lab's recommended block depth for this drafter.
+    --speculative-config: '{"method":"dflash","model":"z-lab/Qwen3.6-35B-A3B-DFlash","num_speculative_tokens":15}'
+    --enable-auto-tool-choice: true
+    --tool-call-parser: qwen3_coder
+    --reasoning-parser: qwen3
+  notes:
+    - >-
+      A hybrid model: only 10 of its 40 layers are full attention, and those
+      use 2 KV heads. So its KV cache is roughly a third of the 27B recipe's
+      per token, and full 256K context over 2 streams costs about 7 GB.
+    - >-
+      Weights are measured off the node's cache. The KV rate is derived from
+      config.json and calibrated against the 27B's measured rate; the overhead
+      figure is the one estimate left. Read all three off the first startup log
+      and set kvMeasured: true.
+    - >-
+      The drafter and its KV live INSIDE the memory fraction, not beside it, so
+      they compete with the target's KV cache rather than adding to the total.
+    - >-
+      The script pinned 0.45 so two models could share the box. These settings
+      ask for far less than that at full context, so the sharing it was tuned
+      for comes free rather than costing context.
+    - >-
+      No tag on the image - it is a nightly, so what runs today is not what ran
+      last week. Pin a digest here if a run needs to be reproducible.
+    - >-
+      Readiness stops at the endpoint answering. The first completion still
+      pays the JIT cold start the script's warm-up request absorbed.
 
 # ---------------------------------------------------------------------------
 # A `service` recipe: a container that wants a GPU, not a vLLM server. It brings
