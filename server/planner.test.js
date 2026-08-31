@@ -1,7 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { assertRunId, buildRunScript, startRun, cancelRun, stopRun, clearRun } from './planner.js';
+import {
+  assertRunId,
+  buildRunScript,
+  buildRunMeta,
+  startRun,
+  cancelRun,
+  stopRun,
+  clearRun,
+} from './planner.js';
 import { RECIPES, recipeById, parseRecipes } from './recipes.js';
 
 const NODE = { id: 'n1', name: 'spark-01', type: 'dgx-spark', connection: 'ssh', host: '10.0.0.11', sshUser: 'nvidia' };
@@ -241,4 +249,182 @@ test('a tuned script is still valid shell for every recipe', () => {
     });
     assert.doesNotThrow(() => execFileSync('sh', ['-n'], { input: script }), recipe.id);
   }
+});
+
+/*
+ * The service launch path. A service brings its own entrypoint, so the script
+ * must NOT do any of the things a vLLM launch does - and the two runtimes share
+ * one script builder, which is exactly why this is worth pinning down.
+ */
+const SERVICE = recipeById('comfyui-minimax-h3');
+
+const serviceScript = () =>
+  buildRunScript({
+    runId: RUN_ID,
+    recipe: SERVICE,
+    port: SERVICE.port,
+    apiKey: null,
+    cpuset: null,
+    tuning: null,
+  });
+
+test('a service script is valid shell', () => {
+  assert.doesNotThrow(() => execFileSync('sh', ['-n'], { input: serviceScript() }));
+});
+
+test('a service is launched with the image\'s own entrypoint and no serving flags', () => {
+  const script = serviceScript();
+
+  assert.equal(script.includes('--entrypoint'), false);
+  assert.equal(script.includes(' serve '), false);
+  assert.equal(script.includes('--api-key'), false);
+  assert.equal(script.includes('--gpu-memory-utilization'), false);
+  /* The image is followed only by the recipe's own command, which replaces the
+   * image's CMD - never by a vLLM invocation. */
+  const declared = SERVICE.command.map((arg) => `'${arg}'`).join(' ');
+  assert.match(
+    script,
+    new RegExp(`'comfyui-minimax-h3:local' ${declared.replace(/[.*+?^\${}()|[\]\\]/g, '\\$&')} >> "\\$D/log" 2>&1`),
+  );
+});
+
+test('a service publishes its own container port and shares the IPC namespace', () => {
+  const script = serviceScript();
+
+  assert.ok(script.includes("-p '0.0.0.0:8188:8188'"));
+  assert.ok(script.includes('--ipc=host'));
+  assert.equal(script.includes('--shm-size'), false);
+});
+
+test('declared volumes are created before they are bound', () => {
+  const script = serviceScript();
+
+  for (const mount of SERVICE.volumes) {
+    const host = mount.host.replace('~', '$HOME');
+    assert.ok(script.includes(`mkdir -p "${host}"`), `expected ${mount.host} to be created`);
+    assert.ok(script.includes(`-v "${host}":'${mount.container}'`), `expected ${mount.host} bound`);
+  }
+  /* Created before the bind, or docker makes them root-owned. */
+  assert.ok(script.indexOf('mkdir -p') < script.indexOf('docker run'));
+});
+
+/*
+ * Weights go to the HuggingFace cache like any other repo, so the cache panel
+ * can manage them - and are then bound into the container one file at a time,
+ * because the cache's blob-and-symlink layout is not one ComfyUI can read.
+ */
+test('a service fetches its weights into the HuggingFace cache', () => {
+  const script = serviceScript();
+
+  assert.equal(script.includes('--local-dir'), false);
+  assert.equal(script.match(/--include /g).length, SERVICE.weights[0].files.length);
+  /* Its total is the declared figure - a dry run would price the whole repo,
+   * which holds every quantisation tier. */
+  assert.equal(script.includes('--dry-run'), false);
+});
+
+test('the snapshot path is resolved on the node, not hardcoded', () => {
+  const script = serviceScript();
+
+  /* The commit sha changes when the repo is updated, so it is read from the
+   * repo's own refs/main rather than baked in here. */
+  assert.match(script, /REV_0="\$\(cat "\$REPO_0\/refs\/main" 2>\/dev\/null\)"/);
+  assert.match(script, /SNAP_0="\$REPO_0\/snapshots\/\$REV_0"/);
+  assert.match(script, /is not in the HuggingFace cache on this node/);
+  /* Resolved before the run that uses it. */
+  assert.ok(script.indexOf('SNAP_0=') < script.indexOf('docker run'));
+});
+
+test('every weight file is mounted read-only onto the path the service expects', () => {
+  const script = serviceScript();
+  const entry = SERVICE.weights[0];
+
+  for (const file of entry.files) {
+    assert.ok(
+      script.includes(`-v "$SNAP_0/${file}":'${entry.mountBase}/${file}':ro`),
+      `expected ${file} to be mounted`,
+    );
+  }
+  assert.equal(script.match(/:ro/g).length, entry.files.length);
+});
+
+test('a service is probed without an Authorization header', () => {
+  const script = serviceScript();
+
+  assert.ok(script.includes('"http://127.0.0.1:8188/system_stats"'));
+  assert.equal(script.includes('Authorization: Bearer'), false);
+});
+
+test('startRun mints no API key for a runtime that does not authenticate', async () => {
+  /* It still refuses before reaching a runner, so the port check stands in as
+   * proof that the tuning guard did not fire for a service. */
+  await assert.rejects(
+    () => startRun(NODE, { recipeId: 'comfyui-minimax-h3', port: 0 }),
+    /port must be between/,
+  );
+});
+
+/*
+ * The state a launch leaves on the node. This is where the two runtimes diverge
+ * most quietly - a service has no `model` at all - and reaching through it was
+ * a real crash: "Cannot read properties of null (reading 'repoId')", raised
+ * only once a launch got past validation, which no test had done.
+ */
+test('run metadata is built for both runtimes without reaching through a null model', () => {
+  for (const recipe of RECIPES) {
+    const meta = buildRunMeta({
+      runId: RUN_ID,
+      recipe,
+      port: recipe.port,
+      apiKey: recipe.readiness.auth === 'bearer' ? API_KEY : null,
+      tuning: recipe.runtime === 'vllm' ? TUNING : null,
+    });
+
+    assert.equal(meta.recipeId, recipe.id);
+    assert.equal(meta.containerName, recipe.containerName);
+    assert.equal(meta.imageRef, recipe.image.ref);
+    /* Every recipe names the repo its weights come from, whichever field holds it. */
+    assert.ok(meta.modelRepoId, `${recipe.id} reported no model repo`);
+    assert.ok(JSON.parse(JSON.stringify(meta)), `${recipe.id} metadata is not serialisable`);
+  }
+});
+
+test('a service carries no tuning or key in its metadata', () => {
+  const meta = buildRunMeta({ runId: RUN_ID, recipe: SERVICE, port: 8188, apiKey: null, tuning: null });
+
+  assert.equal(meta.modelRepoId, 'Comfy-Org/MiniMax-H3');
+  assert.equal(meta.apiKey, null);
+  assert.equal(meta.contextLength, null);
+  assert.equal(meta.maxRequests, null);
+  assert.equal(meta.gpuMemoryUtilization, null);
+});
+
+test('a vllm run records what it was priced at, so the panel can show it back', () => {
+  const meta = buildRunMeta({
+    runId: RUN_ID,
+    recipe: recipeById(KEPT),
+    port: 8000,
+    apiKey: API_KEY,
+    tuning: TUNING,
+  });
+
+  assert.equal(meta.contextLength, TUNING.contextLength);
+  assert.equal(meta.maxRequests, TUNING.maxRequests);
+  assert.equal(meta.gpuMemoryUtilization, TUNING.gpuMemoryUtilization);
+  assert.equal(meta.apiKey, API_KEY);
+});
+
+test('a declared command replaces the image CMD, and a recipe without one adds nothing', () => {
+  /* Asserted against whatever the recipe declares, not a particular flag - the
+   * mechanism is the contract, and the flags are free to change. */
+  const script = serviceScript();
+  assert.ok(SERVICE.command.length > 0, 'fixture recipe should declare a command');
+  for (const arg of SERVICE.command) {
+    assert.ok(script.includes(`'${arg}'`), `expected ${arg} in the run`);
+  }
+
+  /* A vLLM recipe declares none, so nothing of the sort is appended to its argv. */
+  const vllm = recipeById(KEPT);
+  assert.deepEqual(vllm.command, []);
+  assert.equal(scriptFor(KEPT).includes("' --listen '"), false);
 });

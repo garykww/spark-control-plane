@@ -205,11 +205,16 @@ export type RunStatus =
 
 /* A whole serving configuration - weights, image and every flag - rather than a
  * template with blanks. Served once per connection; it never changes at runtime. */
+export type RecipeRuntime = 'vllm' | 'service';
+
 export interface Recipe {
   id: string;
+  /* 'vllm' has weights, serving flags and a KV cache to size; 'service' is a
+   * container that brings its own entrypoint and declares a flat figure. */
+  runtime: RecipeRuntime;
   name: string;
   summary: string;
-  modelRepoId: string;
+  modelRepoId: string | null;
   draftRepoId: string | null;
   imageRef: string;
   buildsImage: boolean;
@@ -248,7 +253,8 @@ export interface RecipePlan {
     availableBytes: number | null;
     totalBytes: number | null;
   };
-  /* What this plan was priced at, and the room to move. */
+  /* What this plan was priced at, and the room to move. Null for a service
+   * recipe: there is nothing to tune, so the panel shows no sliders. */
   tuning: {
     contextLength: number;
     maxRequests: number;
@@ -259,7 +265,7 @@ export interface RecipePlan {
     automatic: boolean;
     contextOptions: number[];
     requestOptions: number[];
-  };
+  } | null;
   disk: {
     downloadBytes: number;
     availableBytes: number | null;

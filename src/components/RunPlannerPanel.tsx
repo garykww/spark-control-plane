@@ -323,7 +323,9 @@ function RecipeCard({
           {bytes(plan.memory.requiredBytes)}
         </span>
         <span className="text-[11px] text-ink-muted tabular">
-          {Math.round(plan.tuning.contextLength / 1024)}K × {plan.tuning.maxRequests}
+          {plan.tuning
+            ? `${Math.round(plan.tuning.contextLength / 1024)}K × ${plan.tuning.maxRequests}`
+            : `port ${recipe.port}`}
         </span>
         {cached && <Badge tone="accent">cached</Badge>}
       </span>
@@ -366,10 +368,13 @@ function RecipeDetail({
 }) {
   const [showFlags, setShowFlags] = useState(false);
 
-  const { minUtilization, automatic } = plan.tuning;
-  const utilization = plan.tuning.gpuMemoryUtilization;
-  const contextLength = tuning.contextLength ?? plan.tuning.contextLength;
-  const maxRequests = tuning.maxRequests ?? plan.tuning.maxRequests;
+  /* A service declares one figure and has nothing to tune. */
+  const knobs = plan.tuning;
+  const minUtilization = knobs?.minUtilization ?? null;
+  const automatic = knobs?.automatic ?? true;
+  const utilization = knobs?.gpuMemoryUtilization ?? null;
+  const contextLength = tuning.contextLength ?? knobs?.contextLength ?? 0;
+  const maxRequests = tuning.maxRequests ?? knobs?.maxRequests ?? 0;
 
   /*
    * What vLLM reserves beyond what these settings actually need. In automatic
@@ -398,11 +403,12 @@ function RecipeDetail({
         <span className="text-[11px] text-ink-muted">{recipe.summary}</span>
       </div>
 
+      {knobs ? (
       <div className="flex flex-wrap items-start gap-x-6 gap-y-3">
         <Slider
           label="Context"
           value={contextLength}
-          options={plan.tuning.contextOptions}
+          options={knobs.contextOptions}
           format={(value) => (value >= 1024 ? `${Math.round(value / 1024)}K tokens` : `${value} tokens`)}
           /* Changing the shape moves the minimum, so an absolute fraction chosen
            * against the old one is dropped rather than silently invalidated. */
@@ -411,7 +417,7 @@ function RecipeDetail({
         <Slider
           label="Max requests"
           value={maxRequests}
-          options={plan.tuning.requestOptions}
+          options={knobs.requestOptions}
           format={(value) => `${value} request${value === 1 ? '' : 's'}`}
           onChange={(value) => onTune({ maxRequests: value, gpuMemoryUtilization: null })}
         />
@@ -429,21 +435,41 @@ function RecipeDetail({
           }
         />
       </div>
+      ) : (
+        <p className="text-[11px] text-ink-muted">
+          This recipe reserves a fixed {bytes(plan.memory.requiredBytes)} and takes no serving
+          flags — it starts its own image and there is nothing to size.
+        </p>
+      )}
 
       {pricing && <p className="mt-2 text-[11px] text-ink-muted">pricing…</p>}
 
       {/* The bar above shows the shape; this is the arithmetic behind it. */}
       <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-[11px] sm:grid-cols-4">
-        <Fact label="Weights" value={bytes(plan.memory.weightsBytes)} />
-        <Fact label="Overhead" value={bytes(plan.memory.overheadBytes)} />
-        <Fact
-          label="KV cache"
-          value={`${bytes(plan.memory.kvBytes)} · ${formatTokens(plan.memory.kvTokens)} tokens`}
-        />
-        <Fact
-          label="Reserves"
-          value={`${bytes(plan.memory.claimBytes)}${automatic ? ' (minimum)' : ` (${utilization})`}`}
-        />
+        {knobs ? (
+          <>
+            <Fact label="Weights" value={bytes(plan.memory.weightsBytes)} />
+            <Fact label="Overhead" value={bytes(plan.memory.overheadBytes)} />
+            <Fact
+              label="KV cache"
+              value={`${bytes(plan.memory.kvBytes)} · ${formatTokens(plan.memory.kvTokens)} tokens`}
+            />
+            <Fact
+              label="Reserves"
+              value={`${bytes(plan.memory.claimBytes)}${automatic ? ' (minimum)' : ` (${utilization})`}`}
+            />
+          </>
+        ) : (
+          <>
+            <Fact label="Reserves" value={bytes(plan.memory.requiredBytes)} />
+            <Fact label="Port" value={String(recipe.port)} />
+            <Fact
+              label="To download"
+              value={plan.disk.downloadBytes > 0 ? bytes(plan.disk.downloadBytes) : 'nothing'}
+            />
+            <Fact label="Image" value={plan.imagePresent === false ? 'to build' : 'ready'} />
+          </>
+        )}
       </dl>
 
       {explainSurplus && (
@@ -510,9 +536,11 @@ function RecipeDetail({
         >
           Run this recipe
         </Button>
-        <Button onClick={() => setShowFlags((value) => !value)}>
-          {showFlags ? 'Hide flags' : 'Show flags'}
-        </Button>
+        {recipe.args.length > 0 && (
+          <Button onClick={() => setShowFlags((value) => !value)}>
+            {showFlags ? 'Hide flags' : 'Show flags'}
+          </Button>
+        )}
       </div>
 
       {showFlags && (
@@ -530,10 +558,12 @@ function RecipeDetail({
  * owns, then append the computed fraction.
  */
 function tunedArgs(recipe: Recipe, plan: RecipePlan): string[] {
-  const overrides: Record<string, string> = {
-    '--max-model-len': String(plan.tuning.contextLength),
-    '--max-num-seqs': String(plan.tuning.maxRequests),
-  };
+  const overrides: Record<string, string> = plan.tuning
+    ? {
+        '--max-model-len': String(plan.tuning.contextLength),
+        '--max-num-seqs': String(plan.tuning.maxRequests),
+      }
+    : {};
 
   const args: string[] = [];
   for (let i = 0; i < recipe.args.length; i += 1) {
@@ -548,7 +578,7 @@ function tunedArgs(recipe: Recipe, plan: RecipePlan): string[] {
     args.push(arg);
   }
   for (const [flag, value] of Object.entries(overrides)) args.push(flag, value);
-  if (plan.tuning.gpuMemoryUtilization !== null) {
+  if (plan.tuning?.gpuMemoryUtilization != null) {
     args.push('--gpu-memory-utilization', String(plan.tuning.gpuMemoryUtilization));
   }
   return args;
@@ -695,7 +725,7 @@ function RunProgress({
             <Badge>{stopped ? 'stopped' : run.status}</Badge>
           </div>
           <p className="mt-0.5 truncate text-[11px] text-ink-muted">
-            {run.modelRepoId}
+            {run.modelRepoId || run.containerName}
             {elapsed && ` · ${live ? 'running' : 'took'} ${elapsed}`}
           </p>
         </div>
@@ -855,12 +885,22 @@ function ConfirmDialog({
         {/* The settings being committed to, since they are what the memory
             figure was priced at and what the container will actually serve. */}
         <dl className="mt-3 grid grid-cols-3 gap-x-3 rounded-lg bg-surface-2 px-3 py-2 text-[11px]">
-          <Fact label="Context" value={`${Math.round(plan.tuning.contextLength / 1024)}K`} />
-          <Fact label="Max requests" value={String(plan.tuning.maxRequests)} />
-          <Fact
-            label="GPU memory"
-            value={`${bytes(plan.memory.claimBytes)}${plan.tuning.automatic ? ' (min)' : ''}`}
-          />
+          {plan.tuning ? (
+            <>
+              <Fact label="Context" value={`${Math.round(plan.tuning.contextLength / 1024)}K`} />
+              <Fact label="Max requests" value={String(plan.tuning.maxRequests)} />
+              <Fact
+                label="GPU memory"
+                value={`${bytes(plan.memory.claimBytes)}${plan.tuning.automatic ? ' (min)' : ''}`}
+              />
+            </>
+          ) : (
+            <>
+              <Fact label="Reserves" value={bytes(plan.memory.requiredBytes)} />
+              <Fact label="Port" value={String(recipe.port)} />
+              <Fact label="Web UI" value="no auth" />
+            </>
+          )}
         </dl>
 
         <p className="mt-3 text-[11px] text-ink-muted">
