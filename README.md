@@ -161,7 +161,15 @@ Sizes come from `hf` itself, which reports in decimal units (a repo `du` measure
 
 The node detail page lists a set of **recipes** — whole serving configurations, not templates with blanks. Each one names its weights, its image and every vLLM flag it will serve with. Pick one that fits and press **Run this recipe**; the node then downloads the weights, pulls the image, starts the container, and waits until the served endpoint actually answers.
 
-The catalogue ships one recipe: **Qwen3.8-27B · NVFP4 + DFlash2**, the drafted 4-bit configuration from `serve-qwen38-27b-vllm-tuned.sh` — the one measured end to end on real hardware. Add your own by appending to the list.
+The catalogue ships three, each a port of a reference launcher:
+
+| Recipe | From | Figures |
+| --- | --- | --- |
+| **Qwen3.8-27B · NVFP4 + DFlash2** | `serve-qwen38-27b-vllm-tuned.sh` | Measured end to end on real hardware |
+| **Qwen3.6-35B-A3B · NVFP4 + DFlash** | `serve-qwen36-35b-a3b-dflash.sh` | Estimated — derived from the script's own sizing prose, and labelled as such in the panel |
+| **ComfyUI · MiniMax H3** | `run-comfyui-h3-spark.sh` | Measured on a GB10; a `service` recipe, so no KV cache and nothing to tune |
+
+Add your own by appending to the list.
 
 **Why whole recipes and not dropdowns.** The tuning is interdependent: DFlash2 needs a target with an unquantised `lm_head`, GDN layers only work under one specific mamba cache mode, and FP8 KV needs calibration scales the NVFP4 exports ship and the FP8 export doesn't. A screen of independent dropdowns would mostly produce combinations that fail at load, several minutes into a weight load.
 
