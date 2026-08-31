@@ -161,12 +161,13 @@ Sizes come from `hf` itself, which reports in decimal units (a repo `du` measure
 
 The node detail page lists a set of **recipes** — whole serving configurations, not templates with blanks. Each one names its weights, its image and every vLLM flag it will serve with. Pick one that fits and press **Run this recipe**; the node then downloads the weights, pulls the image, starts the container, and waits until the served endpoint actually answers.
 
-The catalogue ships three, each a port of a reference launcher:
+The catalogue ships four, each a port of a reference launcher:
 
 | Recipe | From | Figures |
 | --- | --- | --- |
 | **Qwen3.8-27B · NVFP4 + DFlash2** | `serve-qwen38-27b-vllm-tuned.sh` | Measured end to end on real hardware |
-| **Qwen3.6-35B-A3B · NVFP4 + DFlash** | `serve-qwen36-35b-a3b-dflash.sh` | Estimated — derived from the script's own sizing prose, and labelled as such in the panel |
+| **Qwen3.6-35B-A3B · NVFP4 + DFlash** | `serve-qwen36-35b-a3b-dflash.sh` | Weights measured on the node, KV derived from its `config.json`; the overhead figure is an estimate, and the panel labels it |
+| **DiffusionGemma-26B-A4B · NVFP4** | `serve-diffusiongemma-26b-a4b.sh` | Measured, off a real startup log for this model on the node |
 | **ComfyUI · MiniMax H3** | `run-comfyui-h3-spark.sh` | Measured on a GB10; a `service` recipe, so no KV cache and nothing to tune |
 
 Add your own by appending to the list.
