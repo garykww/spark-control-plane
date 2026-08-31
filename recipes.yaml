@@ -8,9 +8,10 @@
 # that fail several minutes into a weight load, so a recipe is picked whole.
 #
 # The catalogue below is the port of serve-qwen38-27b-vllm-tuned.sh,
-# serve-qwen36-35b-a3b-dflash.sh and run-comfyui-h3-spark.sh. Each recipe
-# carries the reasoning from the script it came from, and says which of that
-# script's knobs the planner now decides instead.
+# serve-qwen36-35b-a3b-dflash.sh, serve-diffusiongemma-26b-a4b.sh and
+# run-comfyui-h3-spark.sh. Each recipe carries the reasoning from the script it
+# came from, and says which of that script's knobs the planner now decides
+# instead.
 #
 # Edit this file and restart the server. Every recipe is validated on load: a
 # bad one is reported by name and the whole catalogue is refused rather than
@@ -304,6 +305,178 @@
     - >-
       No tag on the image - it is a nightly, so what runs today is not what ran
       last week. Pin a digest here if a run needs to be reproducible.
+    - >-
+      Readiness stops at the endpoint answering. The first completion still
+      pays the JIT cold start the script's warm-up request absorbed.
+
+# ---------------------------------------------------------------------------
+# Ported from serve-diffusiongemma-26b-a4b.sh.
+#
+# A BLOCK DIFFUSION model, not an autoregressive one: it denoises whole blocks
+# of tokens bidirectionally instead of emitting them left to right. That is the
+# reason for the two unusual flags below - the V2 model runner, which is the
+# only one with diffusion decoding, and TRITON_ATTN, which is the only
+# attention backend that does not assume causal paged decode.
+#
+# EVERY FIGURE HERE IS MEASURED, off a real vLLM startup on nv-spark-01 kept at
+# ~/Workspace/diffusiongemma-26b-a4b-nvfp4-dgx-spark/logs. That run served
+# nvidia/diffusiongemma-26B-A4B-it-NVFP4 - NVIDIA's export of this same model -
+# on this recipe's image, at --gpu-memory-utilization 0.35, --max-model-len
+# 262144, --max-num-seqs 4, --max-num-batched-tokens 32768:
+#
+#   Model loading took                                    18.16 GiB
+#   Available KV cache memory                             17.61 GiB
+#   GPU KV cache size                                    806,319 tokens
+#   Maximum concurrency for 262,144 tokens per request:     3.08x
+#
+# 0.35 of the Spark's 121.68 GiB is 42.59 GiB, so everything that is neither
+# weights nor KV is 42.59 - 18.16 - 17.61 = 6.82 GiB, at 32768 batched tokens.
+# And the pool gives 17.61 / 806,319 = 23,451 bytes per KV token - which is
+# exactly the rate vLLM's own "maximum concurrency" line divides by, so it is
+# the right number for a planner that answers the same question.
+#
+# THE SCRIPT'S MEMORY PROSE IS 10x TOO EXPENSIVE, and this is the whole story
+# of the port. It states "full-precision KV runs ~240 KiB/token here" and sizes
+# everything from that: 64K context, 2 sequences, half the box. Two things are
+# wrong with it, both readable in config.json on the node (revision 8484b309):
+#
+#   - Of 30 layers, layer_types says 25 are sliding_attention with a 1024-token
+#     window and only 5 are full_attention. A windowed layer keeps a fixed
+#     amount of KV per sequence; it does not grow with context. Pricing all 30
+#     as growing attention is where most of the 240 KiB comes from.
+#   - The KV is not full precision. The export carries a modelopt fp4
+#     quantisation config, and vLLM resolves --kv-cache-dtype auto to fp8_e4m3
+#     off the back of it - the log says so on the way up. That halves it again.
+#
+# Architecturally the part that grows with context is the 5 full-attention
+# layers: 5 x 2 (K and V) x 2 kv heads x 512 global_head_dim x 1 byte = 10,240
+# bytes per token. The measured 23,451 is 2.3x that, the difference being the
+# windowed layers' fixed state and the hybrid allocator's page padding. That
+# 2.3x is NOT derived here - it is measured, and it is why the figure below
+# comes from the log rather than from the arithmetic.
+#
+# WHAT DID NOT CARRY OVER from the script, and why:
+#
+#   GPU_MEM_UTIL=0.45   Computed, not declared - see the header. The script
+#                       halved the box by hand so a second vLLM could share it;
+#                       at the real KV rate these settings ask for far less
+#                       than half, so that sharing comes free.
+#   MAX_MODEL_LEN=65536 The native window is 262144, and the log ran at it. The
+#                       script's 64K was a memory budget derived from the KV
+#                       rate above, and this field is a CEILING as well as a
+#                       starting value, so writing 64K here would put the
+#                       model's real reach out of the picker's range for good.
+#   PORT=8001           8001 existed only to dodge the gemma4 launcher on 8000.
+#                       One run at a time per node, so 8000 is free.
+#   --hf-overrides      The script overrides the diffusion sampler to
+#                       entropy_bound at 0.1. generation_config.json on the
+#                       node ALREADY says exactly that
+#                       (EntropyBoundSamplerConfig, entropy_bound 0.1), and
+#                       those keys live in generation_config, not in the HF
+#                       config that --hf-overrides patches. Dropped as both
+#                       redundant and aimed at the wrong file.
+#   API_KEY/SKIP_...    The launcher generates the key; the download phase is
+#                       the pre-stage and is already idempotent.
+#   The JIT warm-up     The script fires a 3-token request after readiness. The
+#                       run stops at the readiness probe, so the FIRST
+#                       completion through this recipe still pays that cost.
+#
+# One flag is here that the script does not have:
+# --override-generation-config. generation_config.json sets max_new_tokens 256,
+# which silently truncates every completion at 256 tokens; the launcher that
+# produced the log above passes this to lift it, and so does the recipe.
+
+- id: diffusiongemma-26b-a4b-nvfp4
+  name: DiffusionGemma-26B-A4B · NVFP4
+  summary: >-
+    A block diffusion model - it denoises blocks of tokens rather than emitting
+    them one at a time. Agentic serving at the full 256K window; 25 of its 30
+    layers are windowed attention, so its KV cache is cheap.
+  model:
+    # Measured: du over the cache blobs on nv-spark-01, 2026-08-31.
+    repo: RedHatAI/diffusiongemma-26B-A4B-it-NVFP4
+    sizeGB: 18.1
+    measured: true
+  image:
+    # The image the measured run used. Tagged but not versioned - `gemma` is a
+    # moving branch build (it reported vLLM 0.22.1rc1.dev357+g74b5964f0), so
+    # pin a digest here if a run has to be reproducible.
+    ref: vllm/vllm-openai:gemma
+  container: spark-run-diffusiongemma
+  port: 8000
+  # Diffusion decoding lives only in the V2 model runner; the V1 runner rejects
+  # the architecture outright.
+  env:
+    VLLM_USE_V2_MODEL_RUNNER: 1
+  # Measured: 42.59 GiB claimed - 18.16 weights - 17.61 KV = 6.82 GiB, at the
+  # --max-num-batched-tokens below. Rounded up: overstating it makes vLLM claim
+  # slightly more than it needs, while understating it leaves a pool too small
+  # for max-model-len and the server exits during startup.
+  overheadGB: 7.5
+  # Measured: 17.61 GiB of pool over 806,319 tokens, fp8 KV. See the header for
+  # why this is a tenth of what the script's prose claims.
+  kvBytesPerToken: 23451
+  kvMeasured: true
+  args:
+    --trust-remote-code: true
+    --enable-prefix-caching: true
+    --enable-chunked-prefill: true
+    # Diffusion decode denoises a block bidirectionally rather than extending a
+    # sequence token by token, which rules out the causal paged-attention
+    # backends. TRITON_ATTN supports it - and Gemma-family heterogeneous head
+    # dims force it on GB10 anyway.
+    --attention-backend: TRITON_ATTN
+    # config.json: max_position_embeddings 262144, and the log ran at it.
+    --max-model-len: 262144
+    # The measured run's concurrency. Only a starting value - the panel offers
+    # up to 64 - unlike the context above, which is also the ceiling.
+    --max-num-seqs: 4
+    # The overhead figure above was measured at this value. Peak activation is
+    # what scales with it, so changing it here without re-reading the log makes
+    # that figure wrong in whichever direction it moved.
+    --max-num-batched-tokens: 32768
+    # Written out rather than left to `auto`. auto resolves to fp8_e4m3 here -
+    # the log says so - off the checkpoint's modelopt fp4 config, so this
+    # changes nothing except tying the measured KV rate to a flag instead of to
+    # an inference vLLM makes about the export.
+    --kv-cache-dtype: fp8
+    # generation_config.json caps max_new_tokens at 256. Without this every
+    # completion stops there, whatever the client asked for.
+    --override-generation-config: '{"max_new_tokens": null}'
+    # Thinking on for every chat request unless the client overrides it. The
+    # model's bundled chat template is used as-is, with no --chat-template, so
+    # that this applies and per-request overrides work.
+    --default-chat-template-kwargs: '{"enable_thinking": true}'
+    --enable-auto-tool-choice: true
+    --tool-call-parser: gemma4
+    --reasoning-parser: gemma4
+  notes:
+    - >-
+      Diffusion decoding needs the V2 model runner and TRITON_ATTN; both are
+      set here and neither is optional. A run that ends with the architecture
+      being rejected has lost one of them.
+    - >-
+      Cheap context. Only 5 of 30 layers are full attention and the rest are
+      windowed at 1024 tokens, so 256K over 4 streams costs about 25 GB of KV -
+      a tenth of what the reference script's sizing prose implies.
+    - >-
+      The checkpoint ships no KV scaling factors, so vLLM falls back to
+      scale 1.0 and says so on the way up. It served fine that way in the
+      measured run. If fp8 accuracy looks wrong, --calculate-kv-scales computes
+      them during prefill instead - untested on this model.
+    - >-
+      The tool and reasoning parsers are Gemma 4's. This model shares Gemma 4's
+      26B-A4B architecture and reasoning format, and the measured run accepted
+      them, but no vLLM parser name is documented for DiffusionGemma - so send
+      a request with a tool schema and confirm it comes back as tool_calls.
+    - >-
+      It ignores repetition, frequency and presence penalties. vLLM logs that
+      it is dropping them per request rather than failing, so a client that
+      relies on them will get output that quietly disagrees with its settings.
+    - >-
+      The measured startup was NVIDIA's export of this model; the recipe serves
+      Red Hat's, which is the one the reference script names. Same architecture
+      and same quantisation, 18.1 GB against 18.9 GB on disk.
     - >-
       Readiness stops at the endpoint answering. The first completion still
       pays the JIT cold start the script's warm-up request absorbed.
