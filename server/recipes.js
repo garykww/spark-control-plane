@@ -47,6 +47,24 @@ export const ARG_RE = /^[A-Za-z0-9 _.,:/@+={}"[\]-]{1,512}$/;
 export const FLAG_RE = /^--[a-z0-9][a-z0-9-]{0,63}$/;
 
 /*
+ * A recipe is either a vLLM serving configuration - weights, flags, a KV cache
+ * whose size is the whole planning question - or a plain containerised service
+ * that happens to want a GPU. ComfyUI is the second kind: no serving flags, no
+ * KV cache, its own entrypoint, and weights that are files in a directory
+ * rather than a repo in the HuggingFace cache.
+ */
+export const RUNTIMES = ['vllm', 'service'];
+
+/* Host paths may use ~ for the node's home; the launcher expands it there. No
+ * spaces, quotes or substitutions - these are interpolated into shell commands. */
+export const HOST_PATH_RE = /^~?\/[A-Za-z0-9_.][A-Za-z0-9_./-]{0,255}$/;
+export const CONTAINER_PATH_RE = /^\/[A-Za-z0-9_][A-Za-z0-9_./-]{0,255}$/;
+export const ENV_KEY_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
+/* A path inside a repo, for `hf download --include`; globs are allowed. */
+export const REPO_PATH_RE = /^[A-Za-z0-9_][A-Za-z0-9_./*-]{0,255}$/;
+export const READINESS_PATH_RE = /^\/[A-Za-z0-9_./-]{0,127}$/;
+
+/*
  * Bounds on the computed fraction. vLLM rejects 1.0, and anything under a tenth
  * of the box cannot hold this class of model however the knobs are set.
  */
@@ -164,6 +182,135 @@ const text = (value, where, max = 400) => {
   return string;
 };
 
+/* Container environment. Gemma's diffusion runner and ComfyUI both need one;
+ * vLLM recipes usually need none. */
+function normaliseEnv(entry, where) {
+  if (entry === undefined || entry === null) return [];
+  if (typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new RecipeError(`${where} must be a map of NAME to value`);
+  }
+
+  return Object.entries(entry).map(([key, value]) => {
+    if (!ENV_KEY_RE.test(key)) throw new RecipeError(`${where}: "${key}" is not a valid variable name`);
+    const text = String(value);
+    if (!ARG_RE.test(text)) throw new RecipeError(`${where}.${key} has characters that cannot be quoted safely`);
+    return { key, value: text };
+  });
+}
+
+/*
+ * Host directories bound into the container. vLLM recipes get the HuggingFace
+ * and vLLM caches implicitly - those paths are shell expressions honouring
+ * HF_HOME, which is why they are not expressed here - so this is for services
+ * that keep their state somewhere of their own choosing.
+ */
+function assertHostPath(value, where) {
+  const path = String(value ?? '');
+  /* Checked before the regex so traversal gets a clearer message than "invalid". */
+  if (path.includes('..')) throw new RecipeError(`${where}: "${path}" may not traverse with ".."`);
+  if (!HOST_PATH_RE.test(path)) throw new RecipeError(`${where}: "${path}" is not a usable host path`);
+  return path;
+}
+
+function normaliseVolumes(entry, where) {
+  if (entry === undefined || entry === null) return [];
+  if (!Array.isArray(entry)) throw new RecipeError(`${where} must be a list`);
+
+  return entry.map((mount, i) => {
+    const at = `${where}[${i}]`;
+    assertHostPath(mount?.host, `${at}.host`);
+    if (!CONTAINER_PATH_RE.test(mount?.container ?? '')) {
+      throw new RecipeError(`${at}.container: "${mount?.container}" must be an absolute path`);
+    }
+    return { host: mount.host, container: mount.container, readOnly: mount.readOnly === true };
+  });
+}
+
+/*
+ * Weights for a service, taken from the HuggingFace cache and bound into the
+ * container one file at a time.
+ *
+ * The cache stores a repo as blobs under a content hash, reachable through a
+ * revision snapshot of symlinks - a layout ComfyUI cannot read, because it
+ * loads by folder and filename. Mounting each file individually bridges that:
+ * the run resolves the snapshot path on the node and binds
+ * <snapshot>/<file> onto <mountBase>/<file>, read-only.
+ *
+ * The payoff is that these weights are ordinary cache entries, so `hf cache ls`
+ * lists them and the HuggingFace panel can measure and delete them like any
+ * other repo. The cost is exactly that: deleting the repo there pulls the
+ * weights out from under a running container.
+ */
+function normaliseWeightMounts(entry, where) {
+  if (entry === undefined || entry === null) return [];
+  if (!Array.isArray(entry)) throw new RecipeError(`${where} must be a list`);
+
+  return entry.map((item, i) => {
+    const at = `${where}[${i}]`;
+    const sizeGB = Number(item?.sizeGB);
+    if (!Number.isFinite(sizeGB) || sizeGB <= 0) {
+      throw new RecipeError(`${at}.sizeGB must be a positive number of GB (got ${item?.sizeGB})`);
+    }
+    if (!CONTAINER_PATH_RE.test(item?.mountBase ?? '')) {
+      throw new RecipeError(`${at}.mountBase: "${item?.mountBase}" must be an absolute path`);
+    }
+
+    const files = item?.files ?? [];
+    if (!Array.isArray(files) || files.length === 0) {
+      throw new RecipeError(`${at}.files must list at least one file to fetch and mount`);
+    }
+    for (const file of files) {
+      const path = String(file);
+      if (path.includes('..')) throw new RecipeError(`${at}.files: "${path}" may not traverse with ".."`);
+      if (!REPO_PATH_RE.test(path)) {
+        throw new RecipeError(`${at}.files: "${path}" is not a usable path inside the repo`);
+      }
+    }
+
+    return {
+      repoId: assertRepo(item.repo, `${at}.repo`),
+      repoType: 'model',
+      mountBase: item.mountBase,
+      files: files.map(String),
+      sizeBytes: sizeGB * GB,
+      measured: item.measured === true,
+    };
+  });
+}
+
+/*
+ * Arguments appended after the image's own entrypoint, replacing its CMD.
+ *
+ * A service normally starts itself, but its defaults are not always right for
+ * the node: ComfyUI's memory manager assumes discrete VRAM, and on unified
+ * memory the flag that governs it is the difference between holding each weight
+ * once and holding it twice.
+ */
+function normaliseCommand(entry, where) {
+  if (entry === undefined || entry === null) return [];
+  if (!Array.isArray(entry)) throw new RecipeError(`${where} must be a list of arguments`);
+
+  return entry.map((arg) => {
+    const text = String(arg);
+    if (!ARG_RE.test(text)) throw new RecipeError(`${where}: "${text}" has characters that cannot be quoted safely`);
+    return text;
+  });
+}
+
+/* How the run decides the service is actually up. vLLM answers an authenticated
+ * /v1/models; everything else says where to look and whether to send the key. */
+function normaliseReadiness(entry, runtime, where) {
+  const fallback = runtime === 'vllm' ? { path: '/v1/models', auth: 'bearer' } : { path: '/', auth: 'none' };
+  if (entry === undefined || entry === null) return fallback;
+
+  const path = entry.path ?? fallback.path;
+  if (!READINESS_PATH_RE.test(path)) throw new RecipeError(`${where}.path: "${path}" is not a usable URL path`);
+
+  const auth = entry.auth ?? fallback.auth;
+  if (auth !== 'bearer' && auth !== 'none') throw new RecipeError(`${where}.auth must be "bearer" or "none"`);
+  return { path, auth };
+}
+
 export function normaliseRecipe(entry, index) {
   if (!entry || typeof entry !== 'object') throw new RecipeError(`recipe ${index + 1} is not a mapping`);
 
@@ -172,6 +319,11 @@ export function normaliseRecipe(entry, index) {
     throw new RecipeError(`recipe ${index + 1}: id "${id}" must be lowercase kebab-case`);
   }
   const at = `recipe "${id}"`;
+
+  const runtime = entry.runtime ?? 'vllm';
+  if (!RUNTIMES.includes(runtime)) {
+    throw new RecipeError(`${at}: runtime must be one of ${RUNTIMES.join(', ')} (got ${runtime})`);
+  }
 
   if (!CONTAINER_NAME_RE.test(entry.container ?? '')) {
     throw new RecipeError(`${at}: container "${entry.container}" is not a valid docker name`);
@@ -182,6 +334,44 @@ export function normaliseRecipe(entry, index) {
     throw new RecipeError(`${at}: port must be between 1 and 65535 (got ${entry.port})`);
   }
 
+  /* What the process listens on inside the container, which is rarely what it
+   * is published as. vLLM images serve 8000; ComfyUI serves 8188. */
+  const containerPort = Number(entry.containerPort ?? (runtime === 'vllm' ? 8000 : port));
+  if (!Number.isInteger(containerPort) || containerPort < 1 || containerPort > 65535) {
+    throw new RecipeError(`${at}: containerPort must be between 1 and 65535 (got ${entry.containerPort})`);
+  }
+
+  const notes = entry.notes ?? [];
+  if (!Array.isArray(notes)) throw new RecipeError(`${at}.notes must be a list`);
+
+  const common = {
+    id,
+    runtime,
+    name: text(entry.name, `${at}.name`, 80),
+    summary: text(entry.summary, `${at}.summary`),
+    image: normaliseImage(entry.image, `${at}.image`),
+    port,
+    containerPort,
+    containerName: entry.container,
+    env: normaliseEnv(entry.env, `${at}.env`),
+    volumes: normaliseVolumes(entry.volumes, `${at}.volumes`),
+    readiness: normaliseReadiness(entry.readiness, runtime, `${at}.readiness`),
+    /* Larger shared memory than docker's 64MB default. vLLM asks for it as a
+     * size; ComfyUI's launcher shares the host namespace instead. Same goal. */
+    ipcHost: entry.ipcHost === true,
+    notes: notes.map((note, i) => text(note, `${at}.notes[${i}]`)),
+  };
+
+  return runtime === 'vllm'
+    ? normaliseVllmRecipe(entry, common, at)
+    : normaliseServiceRecipe(entry, common, at);
+}
+
+/*
+ * A vLLM recipe: weights from the Hub, serving flags, and a KV cache whose size
+ * is the thing the planner actually reasons about.
+ */
+function normaliseVllmRecipe(entry, common, at) {
   const overheadGB = Number(entry.overheadGB);
   if (!Number.isFinite(overheadGB) || overheadGB < 0) {
     throw new RecipeError(`${at}: overheadGB must be a number of GB (got ${entry.overheadGB})`);
@@ -203,18 +393,12 @@ export function normaliseRecipe(entry, index) {
   const servedName = entry.servedName ? text(entry.servedName, `${at}.servedName`, 200) : model.repoId;
   const args = normaliseArgs(entry.args, model.repoId, servedName, `${at}.args`);
 
-  const notes = entry.notes ?? [];
-  if (!Array.isArray(notes)) throw new RecipeError(`${at}.notes must be a list`);
-
   return {
-    id,
-    name: text(entry.name, `${at}.name`, 80),
-    summary: text(entry.summary, `${at}.summary`),
+    ...common,
     model: { repoId: model.repoId, repoType: model.repoType, revision: model.revision },
     draft: draft ? { repoId: draft.repoId, repoType: draft.repoType, revision: draft.revision } : null,
-    image: normaliseImage(entry.image, `${at}.image`),
-    port,
-    containerName: entry.container,
+    weights: [],
+    command: [],
     /*
      * Read back out of the flags rather than declared again beside them. Null
      * means the recipe left it to vLLM, which the UI says rather than guessing.
@@ -231,7 +415,45 @@ export function normaliseRecipe(entry, index) {
       kvMeasured: entry.kvMeasured === true,
     },
     args,
-    notes: notes.map((note, i) => text(note, `${at}.notes[${i}]`)),
+  };
+}
+
+/*
+ * A service recipe: a container that wants a GPU and some disk. There is no KV
+ * cache to size and no fraction to compute, so it declares what it needs as one
+ * figure and the planner checks that figure against the machine.
+ */
+function normaliseServiceRecipe(entry, common, at) {
+  const memoryGB = Number(entry.memoryGB);
+  if (!Number.isFinite(memoryGB) || memoryGB <= 0) {
+    throw new RecipeError(`${at}: memoryGB must be a positive number of GB (got ${entry.memoryGB})`);
+  }
+
+  for (const field of ['model', 'args', 'kvBytesPerToken', 'overheadGB']) {
+    if (entry[field] !== undefined) {
+      throw new RecipeError(`${at}: ${field} belongs to a vllm recipe, not a service one`);
+    }
+  }
+
+  return {
+    ...common,
+    model: null,
+    draft: null,
+    weights: normaliseWeightMounts(entry.weights, `${at}.weights`),
+    command: normaliseCommand(entry.command, `${at}.command`),
+    contextLength: null,
+    concurrency: null,
+    memory: {
+      weightsBytes: 0,
+      weightsMeasured: true,
+      draftBytes: 0,
+      /* The whole reservation, declared rather than derived. */
+      overheadBytes: memoryGB * GB,
+      memoryMeasured: entry.memoryMeasured === true,
+      kvBytesPerToken: 0,
+      kvMeasured: true,
+    },
+    args: [],
   };
 }
 
@@ -305,9 +527,10 @@ export function recipeById(id) {
 export function publicRecipes() {
   return RECIPES.map((recipe) => ({
     id: recipe.id,
+    runtime: recipe.runtime,
     name: recipe.name,
     summary: recipe.summary,
-    modelRepoId: recipe.model.repoId,
+    modelRepoId: recipe.model?.repoId ?? recipe.weights[0]?.repoId ?? null,
     draftRepoId: recipe.draft?.repoId ?? null,
     imageRef: recipe.image.ref,
     buildsImage: Boolean(recipe.image.build),
@@ -316,7 +539,6 @@ export function publicRecipes() {
     contextLength: recipe.contextLength,
     concurrency: recipe.concurrency,
     weightsBytes: recipe.memory.weightsBytes + recipe.memory.draftBytes,
-    gpuMemoryUtilization: recipe.memory.gpuMemoryUtilization,
     args: recipe.args,
     notes: recipe.notes,
   }));
@@ -416,6 +638,16 @@ const ceil2 = (value) => Math.ceil(value * 100) / 100;
  * fixed for the recipe.
  */
 export function sizeFor(recipe, tuning) {
+  if (recipe.runtime !== 'vllm') {
+    return {
+      weightsBytes: 0,
+      overheadBytes: recipe.memory.overheadBytes,
+      kvTokens: 0,
+      kvBytes: 0,
+      requiredBytes: recipe.memory.overheadBytes,
+    };
+  }
+
   const weightsBytes = recipe.memory.weightsBytes + recipe.memory.draftBytes;
   const kvTokens = tuning.contextLength * tuning.maxRequests;
   const kvBytes = kvTokens * recipe.memory.kvBytesPerToken;
@@ -431,6 +663,7 @@ export function sizeFor(recipe, tuning) {
 
 export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
   const pool = memoryPool(snapshot);
+  const isVllm = recipe.runtime === 'vllm';
   const tuning = resolveTuning(recipe, requested);
   const size = sizeFor(recipe, tuning);
   const { weightsBytes, requiredBytes } = size;
@@ -439,30 +672,55 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
    * The smallest fraction of TOTAL memory that still covers what was asked for.
    * vLLM compares its fraction against FREE memory but computes it from total,
    * so this is the number that decides whether the server starts at all.
+   *
+   * A service reserves nothing up front - it allocates as it works - so there
+   * is no fraction to compute and its declared figure is the whole story.
    */
-  const minUtilization = pool.totalBytes
-    ? Math.min(MAX_UTILIZATION, Math.max(MIN_UTILIZATION, ceil2(requiredBytes / pool.totalBytes)))
-    : null;
+  const minUtilization =
+    isVllm && pool.totalBytes
+      ? Math.min(MAX_UTILIZATION, Math.max(MIN_UTILIZATION, ceil2(requiredBytes / pool.totalBytes)))
+      : null;
 
   /* An override buys a deeper prefix cache; below the minimum the KV pool can
    * no longer hold one full-length request and vLLM refuses to start. */
-  const utilization = tuning.override ?? minUtilization;
+  const utilization = isVllm ? (tuning.override ?? minUtilization) : null;
   const claimBytes = pool.totalBytes && utilization ? utilization * pool.totalBytes : null;
 
   const cached = new Set((snapshot.hf?.repos ?? []).map((repo) => repo.repoId));
-  const repos = [recipe.model, recipe.draft].filter(Boolean).map((repo) => ({
-    repoId: repo.repoId,
-    repoType: repo.repoType,
-    cached: cached.has(repo.repoId),
-  }));
+
+  /*
+   * Whether the weights are already here, which for the two runtimes is a
+   * different question. A vLLM repo either appears in `hf cache ls` or does
+   * not; a service's files live in a directory of its own, so the poll measures
+   * that directory and it counts as present once it is nearly the declared size
+   * - `hf download` skips what it already has, so a part-filled directory means
+   * part of the fetch remains.
+   */
+  const repos = isVllm
+    ? [recipe.model, recipe.draft].filter(Boolean).map((repo) => ({
+        repoId: repo.repoId,
+        repoType: repo.repoType,
+        cached: cached.has(repo.repoId),
+      }))
+    : recipe.weights.map((entry) => ({
+        repoId: entry.repoId,
+        repoType: entry.repoType,
+        cached: cached.has(entry.repoId),
+      }));
+
   const toDownload = repos.filter((repo) => !repo.cached);
 
-  /* Only uncached repos cost disk. The split follows the weight estimate, which
-   * is why a partly-cached recipe still reports a sensible remainder. */
-  const downloadBytes = toDownload.reduce(
-    (sum, repo) => sum + (repo.repoId === recipe.draft?.repoId ? recipe.memory.draftBytes : recipe.memory.weightsBytes),
-    0,
-  );
+  /* Only what is missing costs disk. The split follows the declared sizes, so a
+   * partly-fetched recipe still reports a sensible remainder. */
+  const downloadBytes = isVllm
+    ? toDownload.reduce(
+        (sum, repo) =>
+          sum + (repo.repoId === recipe.draft?.repoId ? recipe.memory.draftBytes : recipe.memory.weightsBytes),
+        0,
+      )
+    : recipe.weights
+        .filter((entry) => !cached.has(entry.repoId))
+        .reduce((sum, entry) => sum + entry.sizeBytes, 0);
 
   const mount = cacheMount(snapshot);
   const imagePresent = snapshot.dockerImages ? snapshot.dockerImages.includes(recipe.image.ref) : null;
@@ -582,13 +840,21 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
       message: 'nobody is signed in to the Hub on this node, so gated repos will fail',
     });
   }
-  if (!recipe.memory.weightsMeasured) {
+  if (!isVllm && recipe.memory.memoryMeasured === false) {
+    warnings.push({
+      code: 'estimate',
+      message:
+        `the ${round(recipe.memory.overheadBytes)} GB memory figure is declared by the recipe, ` +
+        `not measured from a run`,
+    });
+  }
+  if (isVllm && !recipe.memory.weightsMeasured) {
     warnings.push({
       code: 'estimate',
       message: `the ${round(weightsBytes)} GB weight figure is estimated from the parameter count, not measured`,
     });
   }
-  if (!recipe.memory.kvMeasured) {
+  if (isVllm && !recipe.memory.kvMeasured) {
     warnings.push({
       code: 'kv-estimate',
       message:
@@ -611,7 +877,9 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
       availableBytes: pool.availableBytes,
       totalBytes: pool.totalBytes,
     },
-    tuning: {
+    /* Null for a service: there is nothing to tune, and the panel hides the
+     * sliders rather than showing controls that do nothing. */
+    tuning: !isVllm ? null : {
       contextLength: tuning.contextLength,
       maxRequests: tuning.maxRequests,
       gpuMemoryUtilization: utilization,
@@ -650,6 +918,10 @@ export function buildPlanner(snapshot, runs = []) {
  * given cannot come apart.
  */
 export function resolveArgs(recipe, tuning) {
+  /* A service takes no serving flags at all - its image's own entrypoint knows
+   * how to start it - so there is nothing to resolve. */
+  if (recipe.runtime !== 'vllm') return [];
+
   const overrides = {
     '--max-model-len': String(tuning.contextLength),
     '--max-num-seqs': String(tuning.maxRequests),

@@ -143,3 +143,118 @@
     - >-
       Check the startup log says "DFlash2DraftModel": a DFlash2 checkpoint on a
       runtime older than 0.27.1 silently drafts as DFlash1.
+
+# ---------------------------------------------------------------------------
+# A `service` recipe: a container that wants a GPU, not a vLLM server. It brings
+# its own entrypoint, keeps its weights in directories of its own, and has no KV
+# cache to size - so it declares what it needs as one figure and the panel shows
+# no tuning sliders for it.
+#
+# Ported from run-comfyui-h3-spark.sh.
+#
+# LICENCE. MiniMax H3 ships under the MiniMax H3 Community License, whose
+# "Excluded Territories" are the EU, the UK, South Korea and the United States.
+# The licence does not grant use rights there. Read it before running this for
+# anything real; the planner will happily start it wherever the node is.
+
+- id: comfyui-minimax-h3
+  runtime: service
+  name: ComfyUI · MiniMax H3
+  summary: >-
+    Text-, image- and reference-to-video with native stereo audio, up to 2K/15s.
+    ComfyUI's own web UI rather than an OpenAI-compatible endpoint.
+  image:
+    # Built out of band from the comfyui-minimax-h3 repo's Dockerfile:
+    #   docker build -t comfyui-minimax-h3:local .
+    # That Dockerfile is 85 lines of ARG/ENV/RUN and clones ComfyUI itself, which
+    # image.build (a base plus RUN steps) cannot express - so the recipe expects
+    # the tag to exist and the panel reports it missing if it does not.
+    ref: comfyui-minimax-h3:local
+  container: comfyui-h3
+  port: 8188
+  containerPort: 8188
+  # Shared memory: ComfyUI's launcher shares the host IPC namespace rather than
+  # asking for a --shm-size, which gets past docker's 64MB default the same way.
+  ipcHost: true
+  # MEASURED on a GB10, 2026-08-31, running a 2K/15s generation:
+  #
+  #   cgroup peak                  58 GiB   staged host-side copies
+  #   nvidia-smi, the same pid     39 GiB   device-resident weights
+  #   -> about 104 GB in total, against a 121.7 GiB pool
+  #
+  # Two things make this far larger than the 66.9 GB of weight files, and both
+  # are specific to unified memory:
+  #
+  # 1. ComfyUI's "offload device: cpu" frees nothing here. Its memory manager
+  #    assumes discrete VRAM, where moving the text encoder to system RAM buys
+  #    back VRAM for the diffusion model. On GB10 both are the same LPDDR5X, so
+  #    the peak is the SUM of the components, not the largest of them:
+  #    25.9 GB text encoder + 32.4 GB diffusion + VAEs, all resident at once.
+  # 2. "Dynamic VRAM loading" keeps a staged host copy AND a device copy of the
+  #    same weights - on one physical pool that is the same bytes counted twice.
+  #
+  # This figure is for the workflow as measured. Activations scale with output
+  # resolution and duration, so a longer or larger generation needs more.
+  memoryGB: 100
+  memoryMeasured: true
+  # Replaces the image's CMD. --listen/--port are its own defaults, repeated
+  # here because naming a command replaces them wholesale.
+  #
+  # --highvram was measured here and is deliberately NOT set. It does cut memory
+  # sharply - about 60 GB against 104 GB, because it drops the staged host copy
+  # ComfyUI keeps alongside the device copy so it can "offload to CPU", which
+  # buys nothing when CPU and GPU are the same LPDDR5X. But it did not stop the
+  # partial unloading it was meant to, and the run was slower than the default.
+  # The memoryGB figure below is the default configuration's, so leaving the
+  # flag off keeps the plan and the container in agreement.
+  command:
+    - --listen
+    - 0.0.0.0
+    - --port
+    - "8188"
+  readiness:
+    # ComfyUI has no authentication of its own; the run probes this bare.
+    path: /system_stats
+    auth: none
+  # Only the writable directories. The weights are not a directory mount: they
+  # come out of the HuggingFace cache, file by file, from `weights` below.
+  # Everything ComfyUI writes lives under one directory, a subfolder per kind.
+  # Workflows especially: ComfyUI saves them inside the container by default, so
+  # without this mount anything you save dies with the container - they are your
+  # data, not container state.
+  volumes:
+    - host: ~/Workspace/comfyui/input
+      container: /workspace/ComfyUI/input
+    - host: ~/Workspace/comfyui/output
+      container: /workspace/ComfyUI/output
+    - host: ~/Workspace/comfyui/workflows
+      container: /workspace/ComfyUI/user/default/workflows
+  weights:
+    # The int8 tier of the fl2va checkpoint set - the launcher's default. Sizes
+    # measured from the files on the Spark, 2026-08-30. The repo holds every
+    # quantisation tier, so this fetches four named files rather than the ~500 GB
+    # whole. Each is bound read-only onto mountBase/<file>, which is the layout
+    # ComfyUI loads from; the cache's own blob-and-symlink layout is not.
+    - repo: Comfy-Org/MiniMax-H3
+      sizeGB: 66.9
+      measured: true
+      mountBase: /workspace/ComfyUI/models
+      files:
+        - diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors
+        - text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
+        - vae/minimax_h3_video_vae_fp16.safetensors
+        - vae/minimax_h3_audio_vae_fp32.safetensors
+  notes:
+    - >-
+      Licensed only outside the EU, UK, South Korea and the United States. Read
+      the MiniMax H3 Community License before using its output for anything.
+    - >-
+      Opens ComfyUI's own web UI on the port below, not an API endpoint. It has
+      no authentication, so treat the port as open to whoever can reach it.
+    - >-
+      Inputs, outputs and saved workflows live under ~/Workspace/comfyui on the
+      node, one subfolder each. The run creates them if they are missing.
+    - >-
+      Its weights are ordinary HuggingFace cache entries, so the cache panel
+      lists and can delete them. Deleting the repo there removes the files a
+      running container is reading.

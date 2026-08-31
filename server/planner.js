@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { createRunner } from './exec/index.js';
 import { HF_RESOLVE, HF_DRY_RUN_TOTAL, cacheFolderName } from './collectors/huggingface.js';
 import { RUNS_DIR, RUN_ID_RE } from './collectors/planner.js';
-import { ARG_RE, recipeById, resolveArgs } from './recipes.js';
+import { ARG_RE, HOST_PATH_RE, recipeById, resolveArgs } from './recipes.js';
 
 /*
  * Write path for the run planner: start a recipe, cancel one, stop the server
@@ -53,6 +53,18 @@ function sq(value) {
   return `'${text}'`;
 }
 
+/*
+ * A host path for the node's shell. `~` is expanded there rather than here,
+ * because the dashboard does not know the remote user's home directory - and
+ * the result is double-quoted so the expansion happens while the rest stays
+ * literal. HOST_PATH_RE has already excluded anything else expandable.
+ */
+function hostPath(value) {
+  const text = String(value);
+  if (!HOST_PATH_RE.test(text)) throw bad(`path cannot be passed to the node safely: ${text}`);
+  return text.startsWith('~') ? `"$HOME${text.slice(1)}"` : `'${text}'`;
+}
+
 function explain(output) {
   const text = String(output ?? '');
   if (/permission denied.*docker|docker.*permission denied/i.test(text)) {
@@ -72,9 +84,21 @@ async function withRunner(node, fn) {
   }
 }
 
-/* One `hf download` per repo, preceded by a dry run so the bar has a total.
- * The blob directory of each goes in `dirs`, which is what the poll sums. */
+/*
+ * One `hf download` per repo, preceded by a dry run so the bar has a total.
+ * The blob directory of each goes in `dirs`, which is what the poll sums.
+ *
+ * A service fetches named FILES into a directory of its own rather than a whole
+ * repo into the HuggingFace cache - ComfyUI wants four files out of a repo that
+ * holds every quantisation tier - so its downloads carry --include and
+ * --local-dir, and their size is the recipe's declared figure rather than a dry
+ * run (a dry run prices the whole repo, not the slice being asked for).
+ */
 function downloadSection(recipe) {
+  return recipe.runtime === 'vllm' ? vllmDownloads(recipe) : serviceDownloads(recipe);
+}
+
+function vllmDownloads(recipe) {
   const repos = [recipe.model, recipe.draft].filter(Boolean);
 
   const measure = repos
@@ -95,6 +119,56 @@ function downloadSection(recipe) {
     .join('\n');
 
   return { measure, fetch, dirs };
+}
+
+function serviceDownloads(recipe) {
+  /* The declared total, so the bar has a denominator without a dry run - a dry
+   * run prices the whole repo, and these repos hold every quantisation tier. */
+  const measure = recipe.weights
+    .map((entry) => `  echo ${sq(String(Math.round(entry.sizeBytes)))}`)
+    .join('\n');
+
+  /* Into the HuggingFace cache, like any other repo, so `hf cache ls` lists it
+   * and the cache panel can manage it. --include keeps it to the named files. */
+  const fetch = recipe.weights
+    .map((entry) => {
+      const includes = entry.files.map((file) => `--include ${sq(file)}`).join(' ');
+      return (
+        `say "--- fetching ${entry.files.length} file(s) from ${entry.repoId}"\n` +
+        `"$HF" download ${sq(entry.repoId)} ${includes} --max-workers 8 >> "$D/log" 2>&1 \\\n` +
+        `  || { say "could not download from ${entry.repoId}"; finish 1; }`
+      );
+    })
+    .join('\n');
+
+  const dirs = recipe.weights
+    .map((entry) => `printf '%s\\n' "$HUB/${cacheFolderName(entry.repoType, entry.repoId)}/blobs" >> "$D/dirs"`)
+    .join('\n');
+
+  return { measure, fetch, dirs };
+}
+
+/*
+ * Resolves each weight repo's snapshot directory on the node.
+ *
+ * The cache addresses a revision by its commit sha, which is not knowable here
+ * - it changes when the repo is updated - so the run reads it out of the repo's
+ * own refs/main and builds the path there. Without this the mounts below would
+ * have to hardcode a sha that goes stale.
+ */
+function snapshotSection(recipe) {
+  return recipe.weights
+    .map((entry, i) => {
+      const folder = cacheFolderName(entry.repoType, entry.repoId);
+      return `REPO_${i}="$HUB/${folder}"
+REV_${i}="$(cat "$REPO_${i}/refs/main" 2>/dev/null)"
+if [ -z "$REV_${i}" ]; then
+  say "${entry.repoId} is not in the HuggingFace cache on this node"
+  finish 1
+fi
+SNAP_${i}="$REPO_${i}/snapshots/$REV_${i}"`;
+    })
+    .join('\n');
 }
 
 /* Pull, or build a derived image when the recipe asks for one. */
@@ -129,27 +203,72 @@ docker build -t ${ref} "$D/build" >> "$D/log" 2>&1 \\
  * whichever image a recipe names.
  */
 function dockerRunSection(recipe, { port, apiKey, cpuset, tuning }) {
+  const isVllm = recipe.runtime === 'vllm';
+
   const flags = [
     '-d',
     `--name ${sq(recipe.containerName)}`,
     '--restart unless-stopped',
     '--gpus all',
-    '--shm-size=32g',
+    /* Both routes past docker's 64MB /dev/shm, which is too small for the
+     * shared memory these runtimes move tensors through. */
+    recipe.ipcHost ? '--ipc=host' : '--shm-size=32g',
     ...(cpuset ? [`--cpuset-cpus ${sq(cpuset)}`] : []),
-    `-p ${sq(`0.0.0.0:${port}:8000`)}`,
-    '-e HF_TOKEN="${HF_TOKEN:-}"',
-    '-v "$HF_CACHE:/root/.cache/huggingface"',
-    '-v "$HOME/.cache/vllm:/root/.cache/vllm"',
-    '--entrypoint vllm',
+    `-p ${sq(`0.0.0.0:${port}:${recipe.containerPort}`)}`,
+    ...recipe.env.map((entry) => `-e ${sq(`${entry.key}=${entry.value}`)}`),
   ];
 
-  /* The tuned context, concurrency and memory fraction replace the recipe's
-   * defaults here, so the container is given exactly what the panel priced. */
-  const args = [...resolveArgs(recipe, tuning), '--api-key', apiKey].map(sq);
+  if (isVllm) {
+    /*
+     * The caches vLLM recipes always want. These are shell expressions rather
+     * than declared volumes because HF_HOME has to be honoured on the node,
+     * where its value is known and ours is not.
+     */
+    flags.push(
+      '-e HF_TOKEN="${HF_TOKEN:-}"',
+      '-v "$HF_CACHE:/root/.cache/huggingface"',
+      '-v "$HOME/.cache/vllm:/root/.cache/vllm"',
+      /*
+       * Pinned deliberately, and the one thing that works against both image
+       * families: the spark-arena builds set no entrypoint, while
+       * vllm/vllm-openai already runs `vllm serve`, so passing `vllm serve ...`
+       * to the latter yields `vllm serve vllm serve ...` and argparse rejects
+       * it. Pinning makes the argv identical whichever image a recipe names.
+       */
+      '--entrypoint vllm',
+    );
+  } else {
+    /* A service keeps its state where it chooses, and starts itself: its image
+     * has an entrypoint that knows how, so nothing is pinned or appended. */
+    flags.push(
+      ...recipe.volumes.map(
+        (mount) => `-v ${hostPath(mount.host)}:${sq(mount.container)}${mount.readOnly ? ':ro' : ''}`,
+      ),
+      /*
+       * Each weight file individually, read-only, from the cache snapshot onto
+       * the path the service expects. Docker resolves the cache's symlink to
+       * its blob, so the container sees an ordinary file where it wants one.
+       */
+      ...recipe.weights.flatMap((entry, i) =>
+        entry.files.map((file) => `-v "$SNAP_${i}/${file}":'${entry.mountBase}/${file}':ro`),
+      ),
+    );
+  }
 
-  return `docker run ${flags.join(' ')} \\
-  ${sq(recipe.image.ref)} serve \\
-  ${args.join(' ')} >> "$D/log" 2>&1`;
+  /* The tuned context, concurrency and memory fraction replace the recipe's
+   * defaults here, so the container is given exactly what the panel priced.
+   * A service has no such flags and is launched bare. */
+  const args = isVllm ? [...resolveArgs(recipe, tuning), '--api-key', apiKey].map(sq) : [];
+
+  /* A service's own entrypoint starts it; anything here replaces the image's
+   * CMD, which is how a recipe corrects a default that is wrong for this node. */
+  const serviceCommand = recipe.command.map(sq).join(' ');
+
+  const command = isVllm
+    ? `${sq(recipe.image.ref)} serve \\\n  ${args.join(' ')}`
+    : `${sq(recipe.image.ref)}${serviceCommand ? ` ${serviceCommand}` : ''}`;
+
+  return `docker run ${flags.join(' ')} \\\n  ${command} >> "$D/log" 2>&1`;
 }
 
 /*
@@ -163,6 +282,10 @@ function dockerRunSection(recipe, { port, apiKey, cpuset, tuning }) {
  */
 export function buildRunScript({ runId, recipe, port, apiKey, cpuset, tuning }) {
   const download = downloadSection(recipe);
+  /* Only a runtime that was given a key can be asked for one. ComfyUI has no
+   * authentication at all, so its probe is a bare GET. */
+  const authHeader =
+    recipe.readiness.auth === 'bearer' ? `-H "Authorization: Bearer ${apiKey}" \\\n        ` : '';
 
   return `#!/bin/sh
 D="$HOME/.cache/spark-control-plane/runs/${runId}"
@@ -219,10 +342,13 @@ ${imageSection(recipe)}
 # ----------------------------------------------------------------- launch ----
 set_phase launch
 printf '%s' ${sq(recipe.containerName)} > "$D/container"
+${recipe.volumes.map((mount) => `mkdir -p ${hostPath(mount.host)}`).join('\n') || ': no declared volumes'}
 
 # Replace any container left by an earlier run of this same recipe. Only this
 # recipe's own name is ever removed.
 docker rm -f ${sq(recipe.containerName)} >/dev/null 2>&1
+
+${snapshotSection(recipe) || ': no cached weights to mount'}
 
 say "--- starting ${recipe.containerName} on port ${port}"
 ${dockerRunSection(recipe, { port, apiKey, cpuset, tuning })} \\
@@ -251,8 +377,7 @@ while :; do
   fi
 
   if [ -n "$CURL" ]; then
-    if "$CURL" -sf -m 5 -H "Authorization: Bearer ${apiKey}" \\
-        "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+    if "$CURL" -sf -m 5 ${authHeader}"http://127.0.0.1:${port}${recipe.readiness.path}" >/dev/null 2>&1; then
       break
     fi
   elif [ "$(date +%s)" -ge "$settled" ]; then
@@ -274,13 +399,43 @@ finish 0
 `;
 }
 
+/*
+ * What the run leaves on the node for the poll to read back.
+ *
+ * Separated out because it is the one part of a launch that is pure, and it is
+ * where the two runtimes differ most quietly: a service has no `model` at all,
+ * so anything reaching through it has to say so rather than assume.
+ */
+export function buildRunMeta({ runId, recipe, port, apiKey, tuning }) {
+  return {
+    runId,
+    recipeId: recipe.id,
+    recipeName: recipe.name,
+    /* A vLLM recipe serves one model; a service's headline is the repo its
+     * weights come from, if it has one at all. */
+    modelRepoId: recipe.model?.repoId ?? recipe.weights?.[0]?.repoId ?? null,
+    draftRepoId: recipe.draft?.repoId ?? null,
+    imageRef: recipe.image.ref,
+    containerName: recipe.containerName,
+    port,
+    apiKey,
+    contextLength: tuning?.contextLength ?? null,
+    maxRequests: tuning?.maxRequests ?? null,
+    gpuMemoryUtilization: tuning?.gpuMemoryUtilization ?? null,
+    createdAt: new Date().toISOString(),
+  };
+}
+
 export async function startRun(node, { recipeId, port, tuning } = {}) {
   const recipe = recipeById(recipeId);
 
-  /* Always the plan's own resolved tuning, never the raw request body: the
-   * memory fraction in particular is computed against a live memory reading
-   * and must not be something a caller can assert. */
-  if (!tuning?.contextLength || !tuning?.maxRequests || !tuning?.gpuMemoryUtilization) {
+  /*
+   * Always the plan's own resolved tuning, never the raw request body: the
+   * memory fraction in particular is computed against a live memory reading and
+   * must not be something a caller can assert. A service has nothing to tune,
+   * so it carries none and none is required.
+   */
+  if (recipe.runtime === 'vllm' && (!tuning?.contextLength || !tuning?.maxRequests || !tuning?.gpuMemoryUtilization)) {
     throw bad('a resolved plan is required to start a run');
   }
 
@@ -291,7 +446,10 @@ export async function startRun(node, { recipeId, port, tuning } = {}) {
   }
 
   const runId = `run-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  const apiKey = `sk-${crypto.randomBytes(24).toString('hex')}`;
+  /* Only minted for a runtime that actually authenticates. ComfyUI has no auth,
+   * and advertising a key it ignores would be worse than showing none. */
+  const apiKey =
+    recipe.readiness.auth === 'bearer' ? `sk-${crypto.randomBytes(24).toString('hex')}` : null;
 
   /* The recipe's CPU pinning targets GB10's Cortex-X925 cores. A smaller host
    * has no core 19 and docker would refuse the run outright, so it is applied
@@ -299,21 +457,7 @@ export async function startRun(node, { recipeId, port, tuning } = {}) {
   const cpuset = node.type === 'dgx-spark' ? '5-9,15-19' : null;
 
   const script = buildRunScript({ runId, recipe, port: chosenPort, apiKey, cpuset, tuning });
-  const meta = JSON.stringify({
-    runId,
-    recipeId: recipe.id,
-    recipeName: recipe.name,
-    modelRepoId: recipe.model.repoId,
-    draftRepoId: recipe.draft?.repoId ?? null,
-    imageRef: recipe.image.ref,
-    containerName: recipe.containerName,
-    port: chosenPort,
-    apiKey,
-    contextLength: tuning.contextLength,
-    maxRequests: tuning.maxRequests,
-    gpuMemoryUtilization: tuning.gpuMemoryUtilization,
-    createdAt: new Date().toISOString(),
-  });
+  const meta = JSON.stringify(buildRunMeta({ runId, recipe, port: chosenPort, apiKey, tuning }));
 
   const b64 = (text) => Buffer.from(text, 'utf8').toString('base64');
 

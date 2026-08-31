@@ -665,3 +665,191 @@ test('resolveArgs puts the tuned values into the argv exactly once', () => {
   /* The model is still the positional first argument. */
   assert.equal(args[0], recipe.model.repoId);
 });
+
+/*
+ * Service recipes: a container that wants a GPU rather than a vLLM server. The
+ * interesting cases are the ones where the two runtimes must NOT share
+ * behaviour - no serving flags, no memory fraction, weights in a directory of
+ * their own rather than the HuggingFace cache.
+ */
+
+const SERVICE = `
+- id: comfy
+  runtime: service
+  name: ComfyUI
+  summary: A container that brings its own entrypoint.
+  image:
+    ref: comfyui:local
+  container: comfy
+  port: 8188
+  containerPort: 8188
+  ipcHost: true
+  memoryGB: 40
+  memoryMeasured: false
+  readiness:
+    path: /system_stats
+    auth: none
+  volumes:
+    - host: ~/comfy-output
+      container: /workspace/ComfyUI/output
+  weights:
+    - repo: Comfy-Org/MiniMax-H3
+      sizeGB: 60
+      measured: true
+      mountBase: /workspace/ComfyUI/models
+      files:
+        - diffusion_models/a.safetensors
+`;
+
+const service = (replacements = {}) => {
+  let yaml = SERVICE;
+  for (const [from, to] of Object.entries(replacements)) {
+    if (!yaml.includes(from)) throw new Error(`fixture has no "${from}" to replace`);
+    yaml = yaml.replace(from, to);
+  }
+  return parseRecipes(yaml)[0];
+};
+
+test('a service recipe loads with its own entrypoint, port and readiness probe', () => {
+  const recipe = service();
+
+  assert.equal(recipe.runtime, 'service');
+  assert.equal(recipe.containerPort, 8188);
+  assert.deepEqual(recipe.readiness, { path: '/system_stats', auth: 'none' });
+  assert.equal(recipe.ipcHost, true);
+  /* No serving flags at all - the image knows how to start itself. */
+  assert.deepEqual(recipe.args, []);
+  assert.equal(recipe.model, null);
+});
+
+test('the two runtimes default their container port and readiness differently', () => {
+  const vllm = recipeById(KEPT);
+  assert.equal(vllm.containerPort, 8000);
+  assert.deepEqual(vllm.readiness, { path: '/v1/models', auth: 'bearer' });
+});
+
+test('a service reserves the figure it declares, with nothing to tune', () => {
+  const entry = planOf(service(), roomyNode());
+
+  assert.equal(entry.memory.requiredBytes, 40e9);
+  assert.equal(entry.memory.kvBytes, 0);
+  /* No fraction: a service allocates as it works rather than reserving a block. */
+  assert.equal(entry.memory.claimBytes, null);
+  assert.equal(entry.tuning, null);
+  assert.equal(entry.fits, true);
+});
+
+test('a service too large for the node is blocked like any other recipe', () => {
+  const node = roomyNode({ memory: { total: SPARK_MEMORY, used: 100 * GB, available: 30 * GB } });
+  const entry = planOf(service({ 'memoryGB: 40': 'memoryGB: 90' }), node);
+
+  assert.equal(entry.fits, false);
+  assert.ok(codes(entry.blockers).includes('memory'));
+  /* And never for a reason that only applies to vLLM. */
+  assert.equal(codes(entry.blockers).includes('gpu-memory-utilization'), false);
+});
+
+test('a declared memory figure is labelled as an estimate unless measured', () => {
+  assert.ok(codes(planOf(service(), roomyNode()).warnings).includes('estimate'));
+  assert.equal(
+    codes(planOf(service({ 'memoryMeasured: false': 'memoryMeasured: true' }), roomyNode()).warnings)
+      .includes('estimate'),
+    false,
+  );
+});
+
+/*
+ * A service's weights are ordinary cache entries, so both runtimes answer "is
+ * it here" the same way - out of `hf cache ls`. That is the whole point of
+ * keeping them there rather than in a directory of their own.
+ */
+test('a service reads its weights from the HuggingFace cache like any recipe', () => {
+  const cached = roomyNode({
+    hf: {
+      available: true,
+      user: 'someone',
+      cacheDir: '/home/nvidia/.cache/huggingface',
+      repos: [{ repoId: 'Comfy-Org/MiniMax-H3' }],
+    },
+  });
+
+  const here = planOf(service(), cached);
+  assert.equal(here.repos[0].cached, true);
+  assert.equal(here.disk.downloadBytes, 0);
+
+  const missing = planOf(service(), roomyNode());
+  assert.equal(missing.repos[0].cached, false);
+  assert.equal(missing.disk.downloadBytes, 60e9);
+});
+
+test('a service declares where each weight file is mounted', () => {
+  const [entry] = service().weights;
+
+  assert.equal(entry.mountBase, '/workspace/ComfyUI/models');
+  assert.deepEqual(entry.files, ['diffusion_models/a.safetensors']);
+});
+
+test('resolveArgs gives a service nothing, whatever it is handed', () => {
+  assert.deepEqual(
+    resolveArgs(service(), { contextLength: 4096, maxRequests: 2, gpuMemoryUtilization: 0.5 }),
+    [],
+  );
+});
+
+test('vllm-only fields are refused on a service rather than silently ignored', () => {
+  for (const field of ['overheadGB: 8', 'kvBytesPerToken: 44827']) {
+    assert.throws(() => service({ 'memoryGB: 40': `memoryGB: 40\n  ${field}` }), /belongs to a vllm recipe/);
+  }
+});
+
+test('a service whose weights lack a mount point is refused', () => {
+  assert.throws(
+    () => service({ '      mountBase: /workspace/ComfyUI/models\n': '' }),
+    /mountBase.*must be an absolute path/,
+  );
+});
+
+test('a service without a memory figure is refused', () => {
+  assert.throws(() => service({ '  memoryGB: 40\n': '' }), /memoryGB must be a positive number/);
+});
+
+test('an unknown runtime is refused', () => {
+  assert.throws(() => service({ 'runtime: service': 'runtime: kubernetes' }), /runtime must be one of/);
+});
+
+/* Every path in a service recipe reaches a shell on the node. */
+test('host and container paths that could escape their quoting are refused', () => {
+  const hostile = [
+    ['host: ~/comfy-output', "host: '~/x; rm -rf /'"],
+    ['host: ~/comfy-output', 'host: ~/../../etc'],
+    ['container: /workspace/ComfyUI/output', "container: '/x$(id)'"],
+    ['container: /workspace/ComfyUI/output', 'container: relative/path'],
+    ['mountBase: /workspace/ComfyUI/models', "mountBase: '/x$(id)'"],
+    ['- diffusion_models/a.safetensors', "- '../../etc/passwd'"],
+    ['path: /system_stats', "path: '/x; rm -rf /'"],
+  ];
+
+  for (const [from, to] of hostile) {
+    assert.throws(() => service({ [from]: to }), /recipe "comfy"/, `expected ${to} to be refused`);
+  }
+});
+
+test('environment variables are validated and reach the recipe', () => {
+  const recipe = service({ '  memoryGB: 40': '  env:\n    VLLM_USE_V2_MODEL_RUNNER: 1\n  memoryGB: 40' });
+  assert.deepEqual(recipe.env, [{ key: 'VLLM_USE_V2_MODEL_RUNNER', value: '1' }]);
+
+  assert.throws(
+    () => service({ '  memoryGB: 40': '  env:\n    lowercase: 1\n  memoryGB: 40' }),
+    /is not a valid variable name/,
+  );
+});
+
+test('the shipped service recipe keeps its weights in the cache', () => {
+  const comfy = recipeById('comfyui-minimax-h3');
+
+  assert.equal(comfy.runtime, 'service');
+  assert.equal(comfy.weights.length, 1);
+  assert.equal(comfy.weights[0].mountBase, '/workspace/ComfyUI/models');
+  /* No directory of weights to bind - only the writable dirs are volumes. */
+  assert.equal(comfy.volumes.some((v) => v.container.endsWith('/models')), false);
+});
