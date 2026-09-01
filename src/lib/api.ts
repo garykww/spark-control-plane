@@ -6,6 +6,7 @@ import type {
   Recipe,
   RecipePlan,
   TestResult,
+  VaultEntry,
 } from './types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -65,6 +66,21 @@ export const api = {
 
   testNode: (input: Partial<NodeInput> & { id?: string }) =>
     request<TestResult>('/nodes/test', { method: 'POST', body: JSON.stringify(input) }),
+
+  /* The vault. `value` is write-only in both directions: it is never returned,
+   * and every one of these answers with the same public listing so the caller
+   * never has to guess what the store now holds. A change applies to the next
+   * run started, not to anything already serving. */
+  listVault: () => request<{ entries: VaultEntry[] }>('/vault').then((r) => r.entries),
+
+  setVaultSecret: (name: string, value: string) =>
+    request<{ entries: VaultEntry[] }>(`/vault/${name}`, {
+      method: 'PUT',
+      body: JSON.stringify({ value }),
+    }).then((r) => r.entries),
+
+  clearVaultSecret: (name: string) =>
+    request<{ entries: VaultEntry[] }>(`/vault/${name}`, { method: 'DELETE' }).then((r) => r.entries),
 
   power: (id: string, action: 'shutdown' | 'reboot' | 'wake') =>
     request<{ ok: boolean }>(`/nodes/${id}/power`, { method: 'POST', body: JSON.stringify({ action }) }),

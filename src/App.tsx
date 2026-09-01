@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useDashboard } from './hooks/useDashboard';
 import { api } from './lib/api';
-import type { NodeConfig } from './lib/types';
+import type { NodeConfig, VaultEntry } from './lib/types';
 import { bytesPerSecond, percent, relativeTime, tokensPerSecond } from './lib/format';
 import { Badge, Button, EmptyState, StatTile, StatusDot } from './components/ui';
 import { NodeCard } from './components/NodeCard';
 import { NodeDetail } from './components/NodeDetail';
 import { NodeDialog } from './components/NodeDialog';
+import { VaultDialog } from './components/VaultDialog';
 
 type Theme = 'dark' | 'light' | 'oled';
 const THEMES: Theme[] = ['dark', 'light', 'oled'];
@@ -24,6 +25,8 @@ export default function App() {
     useDashboard();
   const [selected, setSelected] = useState<string>('overview');
   const [dialog, setDialog] = useState<{ open: boolean; node: NodeConfig | null }>({ open: false, node: null });
+  const [vault, setVault] = useState<VaultEntry[]>([]);
+  const [vaultOpen, setVaultOpen] = useState(false);
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem(THEME_KEY) as Theme) ?? 'dark');
   const [toast, setToast] = useState<string | null>(null);
 
@@ -31,6 +34,12 @@ export default function App() {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
+
+  /* Fetched once rather than pushed with the snapshot: it changes only when
+   * someone edits it here, and it carries no value worth re-sending every tick. */
+  useEffect(() => {
+    api.listVault().then(setVault).catch(() => setVault([]));
+  }, []);
 
   useEffect(() => {
     if (!toast) return;
@@ -65,6 +74,11 @@ export default function App() {
     },
     [configById],
   );
+
+  /* Whether a run will serve behind the shared key or one minted for it. The
+   * launch confirmation says which, since it is the difference between a client
+   * that keeps working and one that has to be re-pointed at every new run. */
+  const apiKeySet = vault.some((entry) => entry.name === 'VLLM_API_KEY' && entry.set);
 
   const fleet = useMemo(() => {
     const online = snapshots.filter((n) => n.online);
@@ -117,6 +131,11 @@ export default function App() {
                 </button>
               ))}
             </div>
+
+            <Button onClick={() => setVaultOpen(true)} title="Secrets used when launching recipes">
+              Vault
+              {apiKeySet && <span className="ml-1.5 text-ink-muted">· key set</span>}
+            </Button>
 
             <Button variant="primary" onClick={() => setDialog({ open: true, node: null })}>
               Add node
@@ -185,12 +204,17 @@ export default function App() {
             history={history[active.nodeId]}
             recipes={recipes}
             recipesError={recipesError}
+            sharedApiKey={apiKeySet}
             onEdit={() => setDialog({ open: true, node: configById.get(active.nodeId) ?? null })}
             onPower={(action) => handlePower(active.nodeId, action)}
             onNotice={setToast}
           />
         ) : null}
       </main>
+
+      {vaultOpen && (
+        <VaultDialog entries={vault} onClose={() => setVaultOpen(false)} onSaved={setVault} />
+      )}
 
       {dialog.open && (
         <NodeDialog

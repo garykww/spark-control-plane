@@ -5,6 +5,7 @@ import { monitor } from '../monitor.js';
 import { createSshRunner } from '../exec/ssh.js';
 import { createLocalRunner } from '../exec/local.js';
 import { getPassword } from '../secrets.js';
+import { listVault, setSecret, clearSecret } from '../vault.js';
 import { probeLlmEndpoint } from '../collectors/llm.js';
 import { powerAction, wakeOnLan } from '../power.js';
 import { containerAction } from '../containers.js';
@@ -45,6 +46,29 @@ api.get('/config', (req, res) => {
     sparkSpec: DGX_SPARK_SPEC,
   });
 });
+
+/*
+ * The vault: control-plane secrets that are not tied to one node. Values are
+ * write-only - what comes back says whether a secret is set and shows its last
+ * four characters, never the secret itself.
+ *
+ * A change here applies to the next run started. A container already serving
+ * keeps the key it was launched with, which is the key the run panel shows
+ * against it, so nothing already running is invalidated by editing this.
+ */
+api.get('/vault', (req, res) => {
+  res.json({ entries: listVault() });
+});
+
+api.put('/vault/:name', route(async (req, res) => {
+  setSecret(req.params.name, req.body?.value);
+  res.json({ entries: listVault() });
+}));
+
+api.delete('/vault/:name', route(async (req, res) => {
+  clearSecret(req.params.name);
+  res.json({ entries: listVault() });
+}));
 
 api.get('/nodes', (req, res) => {
   res.json({ nodes: registry.listPublic() });
