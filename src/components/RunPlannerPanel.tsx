@@ -11,6 +11,9 @@ interface Props {
   recipes: Recipe[];
   /* Set when recipes.yaml could not be read or is invalid. */
   error: string | null;
+  /* True when the vault holds a VLLM_API_KEY. A run then serves behind that key
+   * instead of one minted for it, which is what the confirmation states. */
+  sharedApiKey: boolean;
   onResult: (message: string) => void;
 }
 
@@ -29,7 +32,7 @@ interface Props {
  * panel shows and the ones the launch route enforces are the same figures.
  * Nothing here is optimistic either - a run appears when the node reports it.
  */
-export function RunPlannerPanel({ node, recipes, error, onResult }: Props) {
+export function RunPlannerPanel({ node, recipes, error, sharedApiKey, onResult }: Props) {
   const [selected, setSelected] = useState<string | null>(null);
   const [tuning, setTuning] = useState<RunTuning>({});
   const [priced, setPriced] = useState<RecipePlan | null>(null);
@@ -185,6 +188,7 @@ export function RunPlannerPanel({ node, recipes, error, onResult }: Props) {
           node={node}
           recipe={pending.recipe}
           plan={pending.plan}
+          sharedApiKey={sharedApiKey}
           onCancel={() => setPending(null)}
           onConfirm={confirmRun}
         />
@@ -847,12 +851,14 @@ function ConfirmDialog({
   node,
   recipe,
   plan,
+  sharedApiKey,
   onCancel,
   onConfirm,
 }: {
   node: NodeSnapshot;
   recipe: Recipe;
   plan: RecipePlan;
+  sharedApiKey: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -903,9 +909,14 @@ function ConfirmDialog({
           )}
         </dl>
 
+        {/* What stands in front of the port this opens. A service brings no
+            authentication of its own, so saying "an API key" would be wrong. */}
         <p className="mt-3 text-[11px] text-ink-muted">
-          The server is published on port {recipe.port} of every interface, protected only by a generated API
-          key. The run continues on the node if you close this page.
+          The server is published on port {recipe.port} of every interface,{' '}
+          {recipe.runtime === 'vllm'
+            ? `protected only by an API key — ${sharedApiKey ? 'the one stored in the vault' : 'one generated for this run'}`
+            : 'with no authentication in front of it'}
+          . The run continues on the node if you close this page.
         </p>
 
         <div className="mt-4 flex justify-end gap-2">

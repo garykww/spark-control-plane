@@ -40,7 +40,8 @@ export const config = {
   hfCacheIntervalMs: int(process.env.HF_CACHE_INTERVAL_MS, 30000),
   hfCommandTimeoutMs: int(process.env.HF_COMMAND_TIMEOUT_MS, 25000),
 
-  /* Key used to encrypt stored SSH passwords. Generated on first run if unset. */
+  /* Key used to encrypt stored SSH passwords and vault secrets. Generated on
+   * first run if unset. */
   secretKey: process.env.SECRET_KEY || null,
 
   /* Serves synthetic metrics so the UI can be developed away from real hardware. */
@@ -52,5 +53,6 @@ export const config = {
 export const paths = {
   nodes: path.join(config.configDir, 'nodes.json'),
   secrets: path.join(config.configDir, 'nodes-secrets.json'),
+  vault: path.join(config.configDir, 'vault.json'),
   key: path.join(config.configDir, '.secret-key'),
 };

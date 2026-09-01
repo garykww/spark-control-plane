@@ -389,3 +389,19 @@ export interface TestResult {
   gpu: { ok: boolean; detail: string | null };
   llm: { port: number; ok: boolean; detail: string | null }[];
 }
+
+/*
+ * A control-plane secret. The value is write-only: the server reports whether
+ * one is stored and the last four characters of it, never the secret itself.
+ */
+export interface VaultEntry {
+  name: string;
+  label: string;
+  summary: string;
+  /* What a valid value looks like, shown under the field. */
+  hint: string;
+  placeholder: string;
+  set: boolean;
+  preview: string | null;
+  updatedAt: string | null;
+}

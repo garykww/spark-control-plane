@@ -29,6 +29,8 @@ interface Props {
   history?: History;
   recipes: Recipe[];
   recipesError: string | null;
+  /* True when the vault holds a VLLM_API_KEY, which every new run serves behind. */
+  sharedApiKey: boolean;
   onEdit: () => void;
   onPower: (action: 'shutdown' | 'reboot' | 'wake') => void;
   onNotice: (message: string) => void;
@@ -40,6 +42,7 @@ export function NodeDetail({
   history,
   recipes,
   recipesError,
+  sharedApiKey,
   onEdit,
   onPower,
   onNotice,
@@ -330,7 +333,13 @@ export function NodeDetail({
         </Card>
       )}
 
-      <RunPlannerPanel node={node} recipes={recipes} error={recipesError} onResult={onNotice} />
+      <RunPlannerPanel
+        node={node}
+        recipes={recipes}
+        error={recipesError}
+        sharedApiKey={sharedApiKey}
+        onResult={onNotice}
+      />
 
       <ContainersPanel node={node} onResult={onNotice} />
 

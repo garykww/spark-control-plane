@@ -375,8 +375,9 @@
 #                       those keys live in generation_config, not in the HF
 #                       config that --hf-overrides patches. Dropped as both
 #                       redundant and aimed at the wrong file.
-#   API_KEY/SKIP_...    The launcher generates the key; the download phase is
-#                       the pre-stage and is already idempotent.
+#   API_KEY/SKIP_...    The launcher supplies the key - the vault's
+#                       VLLM_API_KEY, or one it generates for the run; the
+#                       download phase is the pre-stage and is already idempotent.
 #   The JIT warm-up     The script fires a 3-token request after readiness. The
 #                       run stops at the readiness probe, so the FIRST
 #                       completion through this recipe still pays that cost.

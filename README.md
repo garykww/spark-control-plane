@@ -94,9 +94,23 @@ Every setting is an environment variable, and every one is optional. `.env.examp
 | `RECIPES_FILE` | `./recipes.yaml` | The run planner's recipe catalogue |
 | `DEMO_MODE` | off | Serve synthetic metrics |
 
-Runtime state lives in `config/`: `nodes.json` holds the node list, `nodes-secrets.json` holds SSH passwords encrypted with AES-256-GCM, and `.secret-key` holds the generated key when you haven't set `SECRET_KEY`. All three are gitignored.
+Runtime state lives in `config/`: `nodes.json` holds the node list, `nodes-secrets.json` holds SSH passwords encrypted with AES-256-GCM, `vault.json` holds the control plane's own secrets under the same encryption, and `.secret-key` holds the generated key when you haven't set `SECRET_KEY`. All four are gitignored.
 
-Set `SECRET_KEY` yourself if you rebuild containers without persisting `config/`. Without it, a new key is generated and previously stored passwords can't be decrypted — you'd have to re-enter them.
+Set `SECRET_KEY` yourself if you rebuild containers without persisting `config/`. Without it, a new key is generated and previously stored passwords and vault secrets can't be decrypted — you'd have to re-enter them.
+
+### The vault
+
+**Vault** in the header holds the secrets the control plane uses on your behalf, encrypted at rest like the SSH passwords. There is one entry today:
+
+| Secret | Used for |
+|---|---|
+| `VLLM_API_KEY` | The `--api-key` every new vLLM run serves behind |
+
+Set it and every recipe you launch from then on serves behind that one key, so a client configured once keeps working across runs, nodes and restarts. Leave it unset and each run mints a random `sk-…` of its own — safe, but it has to be read back off the run before anything can call the endpoint.
+
+Values are write-only. Once stored, the server reports only that a secret is set and its last four characters; there is no endpoint that hands it back. The key a *particular* run is serving behind is still shown beside that run's URL, which is where you copy it from.
+
+Changing or removing the key affects the next run started. A container already serving keeps the key it was launched with — the one the run panel shows against it — so editing this never invalidates something already up. A value that no longer decrypts, because `SECRET_KEY` changed, is treated as unset rather than passed to a node.
 
 ## How it works
 
@@ -231,7 +245,7 @@ So the planner works out the *smallest* fraction that covers the context and con
 
 **The run itself.** Like a HuggingFace download, it runs *detached on the node*: closing the page, restarting the dashboard or dropping the SSH connection doesn't touch it. Progress arrives on the normal poll as a phase — Weights, Image, Container, Loading, Serving — with a byte count during the download, which is the only phase with a total to divide by. **Cancel** kills the whole sequence and removes any container it had already started; **Stop server** takes down a finished one.
 
-A run reaches "Serving" only after the endpoint answers a real request, not merely when the container starts. The generated API key is shown alongside the URL:
+A run reaches "Serving" only after the endpoint answers a real request, not merely when the container starts. The key it is serving behind — the vault's `VLLM_API_KEY` if one is set, otherwise the one this run minted — is shown alongside the URL:
 
 ```
 Authorization: Bearer sk-...
@@ -292,6 +306,7 @@ server/
   monitor.js        poll loop, rate derivation, snapshots
   registry.js       node CRUD, validation, persistence
   secrets.js        AES-256-GCM password storage
+  vault.js          control-plane secrets: the shared vLLM API key
   power.js          shutdown, reboot, Wake-on-LAN
   containers.js     docker start / stop / restart
   huggingface.js    model download / delete / reclaim
@@ -301,7 +316,7 @@ server/
   exec/             local and SSH command runners, batching
 src/
   App.tsx           shell, tabs, fleet summary
-  components/       node cards, detail panels, container list, model cache, run planner, add/edit dialog
+  components/       node cards, detail panels, container list, model cache, run planner, add/edit and vault dialogs
   components/viz/   sparkline, line chart, dial, meter
   hooks/            WebSocket state, element sizing
 ```

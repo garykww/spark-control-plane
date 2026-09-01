@@ -3,6 +3,7 @@ import { createRunner } from './exec/index.js';
 import { HF_RESOLVE, HF_DRY_RUN_TOTAL, cacheFolderName } from './collectors/huggingface.js';
 import { RUNS_DIR, RUN_ID_RE } from './collectors/planner.js';
 import { ARG_RE, HOST_PATH_RE, recipeById, resolveArgs } from './recipes.js';
+import { getSecret } from './vault.js';
 
 /*
  * Write path for the run planner: start a recipe, cancel one, stop the server
@@ -426,6 +427,23 @@ export function buildRunMeta({ runId, recipe, port, apiKey, tuning }) {
   };
 }
 
+/*
+ * The key the run will serve behind.
+ *
+ * A key held in the vault is used by every run that authenticates, so one
+ * client configuration keeps working across runs, nodes and restarts. With the
+ * vault empty each run mints its own, which is equally safe but has to be read
+ * back off the run before anything can call it - the previous behaviour, kept
+ * as the fallback so an unconfigured install still serves behind something.
+ *
+ * A runtime that does not authenticate gets none either way: ComfyUI has no
+ * auth at all, and advertising a key it ignores would be worse than showing none.
+ */
+export function apiKeyFor(recipe) {
+  if (recipe.readiness.auth !== 'bearer') return null;
+  return getSecret('VLLM_API_KEY') ?? `sk-${crypto.randomBytes(24).toString('hex')}`;
+}
+
 export async function startRun(node, { recipeId, port, tuning } = {}) {
   const recipe = recipeById(recipeId);
 
@@ -446,10 +464,7 @@ export async function startRun(node, { recipeId, port, tuning } = {}) {
   }
 
   const runId = `run-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  /* Only minted for a runtime that actually authenticates. ComfyUI has no auth,
-   * and advertising a key it ignores would be worse than showing none. */
-  const apiKey =
-    recipe.readiness.auth === 'bearer' ? `sk-${crypto.randomBytes(24).toString('hex')}` : null;
+  const apiKey = apiKeyFor(recipe);
 
   /* The recipe's CPU pinning targets GB10's Cortex-X925 cores. A smaller host
    * has no core 19 and docker would refuse the run outright, so it is applied
