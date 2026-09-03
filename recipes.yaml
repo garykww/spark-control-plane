@@ -7,11 +7,12 @@
 # not. Offering these as independent dropdowns would mostly produce combinations
 # that fail several minutes into a weight load, so a recipe is picked whole.
 #
-# The catalogue below is the port of serve-qwen38-27b-vllm-tuned.sh,
+# Four of the recipes below are ports of serve-qwen38-27b-vllm-tuned.sh,
 # serve-qwen36-35b-a3b-dflash.sh, serve-diffusiongemma-26b-a4b.sh and
-# run-comfyui-h3-spark.sh. Each recipe carries the reasoning from the script it
-# came from, and says which of that script's knobs the planner now decides
-# instead.
+# run-comfyui-h3-spark.sh. Each carries the reasoning from the script it came
+# from, and says which of that script's knobs the planner now decides instead.
+# The fifth, Qwen3-ASR, has no script behind it and derives its figures from the
+# model's own config and from vLLM's source.
 #
 # Edit this file and restart the server. Every recipe is validated on load: a
 # bad one is reported by name and the whole catalogue is refused rather than
@@ -596,3 +597,189 @@
       Its weights are ordinary HuggingFace cache entries, so the cache panel
       lists and can delete them. Deleting the repo there removes the files a
       running container is reading.
+
+# ---------------------------------------------------------------------------
+# NOT a port of a launcher script - this one is new, from
+# https://github.com/QwenLM/Qwen3-ASR (Apache-2.0, weights included).
+#
+# A TRANSCRIPTION server rather than a chat one. Qwen3-ASR is a 24-layer audio
+# encoder in front of a dense 1.7B Qwen3 decoder, and vLLM carries the
+# architecture itself - vllm/model_executor/models/qwen3_asr.py, plus its own
+# Qwen3ASRConfig and Qwen3ASRProcessor in transformers_utils - so nothing here
+# needs --trust-remote-code and the repo's own `qwen-asr` package is not
+# involved. The server answers /v1/audio/transcriptions and
+# /v1/audio/translations as well as /v1/chat/completions, so an OpenAI
+# transcription client points straight at it.
+#
+# THE STOCK IMAGE CANNOT DECODE AUDIO, which is why this is the only recipe
+# here that builds an image instead of pulling one. vLLM keeps its audio
+# dependencies in the `audio` extra - av, scipy, soundfile, soxr - and
+# docker/Dockerfile installs the plain wheel, never that extra. The loaders in
+# vllm/multimodal/media/audio.py degrade to PlaceholderModule rather than
+# failing at import, so the stock image starts, serves /v1/models, PASSES THE
+# READINESS PROBE, and then fails on the first audio file. Four wheels on top
+# of the pinned image is the whole derivation; no part of vLLM is rebuilt, so
+# this build is a minute or two rather than the hours a real aarch64 vLLM
+# build would take.
+#
+# WEIGHTS. Read from the Hub's own file listing for revision 7278e1e7 on
+# 2026-09-03, not off a node's cache - the cache stores these same blobs:
+#
+#   model-00001-of-00002.safetensors   4.220 GB
+#   model-00002-of-00002.safetensors   0.478 GB
+#
+# So 4.7 GB, and `measured: true` because that is a reading of the actual
+# files rather than something derived from the parameter count.
+#
+# KV CACHE. Derived from config.json, and unlike the two hybrids above it needs
+# no correction factor. thinker_config.text_config is a plain dense Qwen3: 28
+# layers, num_key_value_heads 8, head_dim 128, and the -hf export's layer_types
+# lists all 28 of them as full_attention - no sliding window, no linear
+# attention, nothing that keeps a fixed per-sequence state instead. So:
+#
+#   28 layers x 2 (K and V) x 8 kv heads x 128 head_dim x 2 bytes (bf16)
+#     = 114,688 bytes per token
+#
+# The 1.37x block-padding correction the 27B recipe needs comes from
+# --mamba-cache-mode align forcing an 880-token attention page; DiffusionGemma's
+# 2.3x comes from its windowed layers' fixed state. Neither applies to a dense
+# model on vLLM's ordinary 16-token blocks, where the pool divides out to the
+# architectural rate and the only waste is a partial final block per sequence.
+# Still worth replacing with the "GPU KV cache size" line off a real startup.
+#
+# HOW MUCH CONTEXT IS AN HOUR OF AUDIO. 13 tokens per second, exactly: the
+# encoder's _get_feat_extract_output_lengths ends in (frames // 100) * 13, and
+# a mel frame is 10 ms. So a 30-second clip is 390 tokens, and the full 65,536
+# window is about 84 minutes of audio in a single prompt.
+#
+# That number matters less than it looks for the transcription endpoint.
+# SpeechToTextConfig sets max_audio_clip_s from the feature extractor's
+# chunk_length, which is 30, so /v1/audio/transcriptions SPLITS anything longer
+# at the quietest point in a 100 ms window, with 1 second of overlap, and sends
+# each chunk as its own request. Through that endpoint every request is ~400
+# tokens whatever the recording's length, so a short context costs nothing and
+# concurrency is the knob worth raising. The long window only comes into play
+# when a whole recording goes in as one audio_url through /v1/chat/completions.
+#
+# THREE CAPS ON INPUT LENGTH, and the one that bites first is not the obvious
+# one. vLLM enforces VLLM_MAX_AUDIO_CLIP_FILESIZE_MB (25) on the upload,
+# VLLM_MAX_AUDIO_DECODE_DURATION_S (600) during decoding, and
+# VLLM_MAX_AUDIO_DECODE_BYTES (256 MiB) on what decoding may allocate. At the
+# defaults a 20-minute recording is refused for being 20 minutes long, not for
+# being large. They are raised below.
+
+- id: qwen3-asr-1-7b
+  name: Qwen3-ASR-1.7B · BF16
+  summary: >-
+    Speech recognition for 30 languages and 22 Chinese dialects, on vLLM's
+    OpenAI transcription endpoint. A dense 1.7B decoder behind an audio
+    encoder, so the weights are small and the context is the whole cost.
+  model:
+    # Measured: the Hub's file listing at revision 7278e1e7, 2026-09-03.
+    repo: Qwen/Qwen3-ASR-1.7B
+    sizeGB: 4.7
+    measured: true
+  image:
+    # Built on the node, not pulled - see the header. The tag is local and
+    # names what it is; nothing publishes it.
+    ref: vllm-openai-audio:v0.28.0-aarch64
+    build:
+      # The same pinned image the 27B recipe serves on, so the vLLM underneath
+      # is the released v0.28.0 build and not a nightly.
+      from: vllm/vllm-openai:v0.28.0-aarch64
+      run:
+        # vLLM's `audio` extra, minus mistral_common[audio], which only Voxtral
+        # needs. uv is already in the image and this is how the image installs
+        # its own packages. All four have aarch64 wheels, so nothing compiles.
+        #
+        # Deliberately unpinned, which means the tag is NOT reproducible: a
+        # rebuild months from now picks up whatever those four resolve to.
+        # Pin versions here if a run has to be repeatable.
+        - uv pip install --system --no-cache av scipy soundfile soxr
+  container: spark-run-qwen3-asr
+  port: 8000
+  # ESTIMATED, and the least certain figure here. Starting from the 27B's
+  # measured breakdown - 2.73 non-torch + 3.07 activation + 1.81 CUDA graphs =
+  # 7.61 GiB at 8192 batched tokens - and scaling only what depends on model
+  # size: non-torch is a CUDA context and stays ~2.7; activation scales with
+  # hidden size, 2048 here against the 27B's, so call it 1.5; graph capture
+  # over 28 small layers, ~1. That is 5.2 GiB, rounded up to 6 GB.
+  #
+  # Rounded up deliberately: overstating it makes vLLM claim slightly more than
+  # it needs, understating it leaves a pool too small for max-model-len and the
+  # server exits during startup. Read it off the first startup log and replace.
+  overheadGB: 6
+  # Derived from config.json - 28 full-attention layers x 2 x 8 kv heads x 128
+  # head_dim x 2 bytes. See the header for why no padding factor is applied.
+  kvBytesPerToken: 114688
+  kvMeasured: false
+  env:
+    # The three caps from the header, raised together - raising one alone does
+    # nothing, since decoding stops at whichever is lowest. An hour of audio,
+    # and 1 GiB covers an hour of mono 48 kHz float32 PCM with room over.
+    #
+    # These decode buffers are HOST allocations and live OUTSIDE vLLM's
+    # fraction, so they eat the headroom the panel shows as free rather than
+    # anything the plan reserves. VLLM_MAX_AUDIO_PREPROCESS_WORKERS defaults to
+    # 2, so at most two are in flight and the exposure is bounded at ~2 GiB.
+    VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: 256
+    VLLM_MAX_AUDIO_DECODE_DURATION_S: 3600
+    VLLM_MAX_AUDIO_DECODE_BYTES: 1073741824
+  args:
+    --enable-prefix-caching: true
+    --enable-chunked-prefill: true
+    # config.json: text_config.max_position_embeddings 65536. The model's
+    # native window, and a CEILING as well as the starting value - but see the
+    # header: through /v1/audio/transcriptions almost nothing needs it, so
+    # dropping the panel to 8192 costs nothing there and frees most of the KV
+    # pool for concurrency.
+    --max-model-len: 65536
+    # A middle setting, not a measurement. Audio requests are short and this
+    # model is small, so throughput here comes from streams rather than from
+    # context; the panel offers up to 64 and that is the direction to go.
+    --max-num-seqs: 8
+    # The overhead figure above is scaled from a measurement taken at this
+    # value. Peak activation is what tracks it, so changing it here without
+    # re-reading a startup log makes that figure wrong.
+    --max-num-batched-tokens: 8192
+    # Written out rather than left implicit, so the KV rate above is tied to a
+    # flag. auto means "the model's dtype", which is bfloat16 here.
+    #
+    # DO NOT write bfloat16: vLLM only accepts that value for models that
+    # default to fp8 KV, and rejects it for everything else. fp8 is a legal
+    # value and would halve the rate, but this export ships no KV scaling
+    # factors, so it would need --calculate-kv-scales as well. Untested here,
+    # and KV is not the binding constraint on a 4.7 GB model.
+    --kv-cache-dtype: auto
+  notes:
+    - >-
+      A transcription server. Point an OpenAI client at
+      /v1/audio/transcriptions; /v1/audio/translations and
+      /v1/chat/completions with an audio_url work too, and chat is the only way
+      to send a whole recording as a single prompt.
+    - >-
+      This recipe BUILDS its image. The stock vllm/vllm-openai ships without
+      vLLM's audio extra, and its audio loaders degrade to placeholders instead
+      of failing at import - so the stock image would start, pass the readiness
+      probe, and fail on the first audio file. The build adds four wheels.
+    - >-
+      Audio costs 13 tokens per second. A 30-second clip is 390 tokens, and the
+      full 65,536 window is about 84 minutes of audio in one prompt.
+    - >-
+      /v1/audio/transcriptions splits anything over 30 seconds into overlapping
+      chunks and transcribes each as its own request, so through that endpoint
+      the context setting barely matters and concurrency is what to raise.
+      Lowering the panel to 8192 there costs nothing.
+    - >-
+      Three caps limit input length, and at vLLM's defaults the one that bites
+      is 10 minutes of decoded audio, not the 25 MB upload size. This recipe
+      raises all three to an hour. The decode buffers are host allocations that
+      sit outside vLLM's fraction, so they come out of the free headroom.
+    - >-
+      Weights are measured; the KV rate is derived from config.json and the
+      overhead figure is an estimate scaled from another recipe's measurement.
+      Read both off the first startup log and set kvMeasured true.
+    - >-
+      Qwen/Qwen3-ASR-0.6B is the same architecture at a third the weights, and
+      also has a realtime variant for the /v1/realtime WebSocket - that one is
+      not auto-detected and needs its architecture forced with --hf-overrides.
