@@ -96,7 +96,16 @@ export function readLlmCounters(metrics) {
       'vllm:avg_prompt_throughput_toks_per_s',
       'llamacpp:prompt_tokens_seconds',
     ]),
+    /*
+     * Prompt tokens served from the prefix cache. vLLM counts these inside
+     * prompt_tokens_total, so prefill throughput includes work that was never
+     * done - which is exactly why this is worth showing beside it. Only vLLM
+     * publishes it; the other backends report nothing here and it stays null.
+     */
+    cachedTokens: firstOf(metrics, ['vllm:prompt_tokens_cached_total']),
     kvCacheUsage: firstOf(metrics, [
+      /* vLLM's V1 engine renamed this; the old name stays for older servers. */
+      'vllm:kv_cache_usage_perc',
       'vllm:gpu_cache_usage_perc',
       'llamacpp:kv_cache_usage_ratio',
       'sglang:token_usage',

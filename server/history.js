@@ -17,6 +17,7 @@ export const SERIES = [
   'networkRx',
   'networkTx',
   'llmDecodeRate',
+  'llmPrefillRate',
 ];
 
 class Ring {
@@ -76,6 +77,7 @@ export class NodeHistory {
     this.#series.get('networkRx').push(sum(network, 'rxRate'));
     this.#series.get('networkTx').push(sum(network, 'txRate'));
     this.#series.get('llmDecodeRate').push(sum(llm, 'decodeRate'));
+    this.#series.get('llmPrefillRate').push(sum(llm, 'prefillRate'));
   }
 
   toJSON() {

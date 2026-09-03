@@ -48,6 +48,18 @@ export function tokensPerSecond(value: number | null | undefined): string {
   return value >= 100 ? value.toFixed(0) : value.toFixed(1);
 }
 
+/*
+ * A cumulative token counter, which reaches millions on a server that has been
+ * up a while. Compact rather than grouped ("7.98M", not "7,978,960") because it
+ * shares a tile with a label and a share.
+ */
+export function tokenCount(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return DASH;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+  if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
+  return value.toFixed(0);
+}
+
 export function count(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return DASH;
   return value.toLocaleString();

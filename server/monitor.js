@@ -50,6 +50,62 @@ const rate = (current, previous, seconds) => {
   return (current - previous) / seconds;
 };
 
+/*
+ * How far back the token totals reach - the same span the sparklines cover at
+ * the default poll interval, so the totals describe the stretch of time the
+ * charts are drawing rather than some longer window behind them.
+ *
+ * Kept as cumulative counter samples rather than integrated rates: a counter
+ * difference is exact, while summing per-poll rates would inherit every
+ * rounding error and every missed poll. At one sample per poll this is a few
+ * hundred numbers per endpoint, which is nothing.
+ */
+const TOKEN_WINDOW_MS = 10 * 60 * 1000;
+
+/*
+ * Adds one sample of an endpoint's cumulative counters and answers what was
+ * served across the retained span.
+ *
+ * Every backend here publishes cumulative totals, so the answer is simply "now
+ * minus the oldest sample still inside the window" - exact, and immune to a
+ * poll that was skipped or a rate that was rounded.
+ *
+ * A counter that goes backwards means the model server restarted; its history
+ * before that point describes a process that no longer exists, so the window
+ * starts again from the restart rather than reporting a negative total or a
+ * spike. `complete` says whether the span has filled yet, which is what lets
+ * the panel label a partial window honestly instead of implying ten minutes of
+ * data it does not have.
+ */
+export function advanceTokenWindow(previous, sample, windowMs) {
+  let samples = previous ?? [];
+
+  const last = samples.at(-1);
+  if (last && (sample.generated < last.generated || sample.prompt < last.prompt)) samples = [];
+
+  samples = [...samples, sample];
+
+  /* One sample older than the cutoff is kept, so the delta spans the window
+   * fully rather than starting just inside it. */
+  const cutoff = sample.at - windowMs;
+  let first = 0;
+  while (first + 1 < samples.length && samples[first + 1].at <= cutoff) first += 1;
+  samples = samples.slice(first);
+
+  const oldest = samples[0];
+
+  return {
+    samples,
+    window: {
+      seconds: (sample.at - oldest.at) / 1000,
+      complete: sample.at - oldest.at >= windowMs,
+      decode: sample.generated - oldest.generated,
+      prefill: sample.prompt - oldest.prompt,
+      cached: sample.cached - oldest.cached,
+    },
+  };
+}
+
 class NodeMonitor {
   constructor(node) {
     this.nodeId = node.id;
@@ -57,6 +113,8 @@ class NodeMonitor {
     this.snapshot = this.#offlineSnapshot(node, 'waiting for first poll');
     this.consecutiveFailures = 0;
     this.previous = null;
+    /* Cumulative token counters over TOKEN_WINDOW_MS, keyed by endpoint id. */
+    this.tokenWindows = new Map();
     this.runner = null;
     this.timer = null;
     this.stopped = false;
@@ -412,8 +470,34 @@ class NodeMonitor {
    * Token throughput: prefer a rate the backend publishes directly, otherwise
    * diff its cumulative token counters across the interval.
    */
+  /* Tokens over the trailing window for one endpoint. The arithmetic is
+   * advanceTokenWindow's; this only keeps the samples per endpoint. */
+  #tokenWindow(id, counters, now) {
+    if (!counters) {
+      this.tokenWindows.delete(id);
+      return null;
+    }
+
+    const { samples, window } = advanceTokenWindow(this.tokenWindows.get(id), {
+      at: now,
+      generated: counters.generatedTokens ?? 0,
+      prompt: counters.promptTokens ?? 0,
+      cached: counters.cachedTokens ?? 0,
+    }, TOKEN_WINDOW_MS);
+
+    this.tokenWindows.set(id, samples);
+    return window;
+  }
+
   #deriveLlm(probes, elapsedSeconds) {
     const prev = new Map((this.previous?.llm ?? []).map((p) => [p.id, p]));
+
+    /* An endpoint removed from the node's config stops being polled, so drop
+     * its window rather than holding an hour of samples nothing will read. */
+    const live = new Set(probes.map((p) => p.id));
+    for (const id of this.tokenWindows.keys()) {
+      if (!live.has(id)) this.tokenWindows.delete(id);
+    }
 
     return probes.map((probe) => {
       const counters = probe.counters;
@@ -425,6 +509,20 @@ class NodeMonitor {
       const prefillRate = counters?.reportedPrefillRate
         ?? rate(counters?.promptTokens, before?.promptTokens, elapsedSeconds)
         ?? 0;
+      const cachedRate = rate(counters?.cachedTokens, before?.cachedTokens, elapsedSeconds) ?? 0;
+
+      /*
+       * The share of prompt tokens that came from the prefix cache, taken from
+       * the cumulative counters rather than the two rates above: a ratio of
+       * per-poll rates is undefined whenever the server is idle, while this one
+       * holds still and stays readable between requests.
+       */
+      const cachedShare =
+        counters?.cachedTokens != null && counters?.promptTokens > 0
+          ? counters.cachedTokens / counters.promptTokens
+          : null;
+
+      const window = this.#tokenWindow(probe.id, counters, Date.now());
 
       return {
         id: probe.id,
@@ -437,6 +535,21 @@ class NodeMonitor {
         latencyMs: probe.latencyMs,
         decodeRate,
         prefillRate,
+        cachedRate,
+        cachedShare,
+        /*
+         * The cumulative prompt-side counters, carried through as well as their
+         * rates. Prefill arrives in bursts - thousands of tokens in a fraction
+         * of a second, then nothing for minutes - so a rate sampled every poll
+         * reads zero almost always and dilutes the burst it does catch across
+         * the whole interval. The totals are what stay meaningful between
+         * requests, and are what the panel shows for the cached figure.
+         */
+        promptTokens: counters?.promptTokens ?? null,
+        cachedTokens: counters?.cachedTokens ?? null,
+        /* Tokens over the trailing window, or over however much of it has
+         * been observed so far - `complete` distinguishes the two. */
+        window,
         running: counters?.running ?? null,
         queued: counters?.queued ?? null,
         kvCacheUsage: counters?.kvCacheUsage ?? null,

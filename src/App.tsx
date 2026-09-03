@@ -89,6 +89,7 @@ export default function App() {
         ? online.reduce((sum, n) => sum + (n.gpus[0]?.utilization ?? 0), 0) / online.length
         : 0,
       tokens: online.reduce((sum, n) => sum + n.llm.reduce((s, l) => s + l.decodeRate, 0), 0),
+      prefill: online.reduce((sum, n) => sum + n.llm.reduce((s, l) => s + l.prefillRate, 0), 0),
       network: online.reduce(
         (sum, n) => sum + n.network.reduce((s, i) => s + i.rxRate + i.txRate, 0),
         0,
@@ -176,12 +177,14 @@ export default function App() {
                 sub={fleet.online < fleet.total ? `${fleet.total - fleet.online} unreachable` : 'all reachable'}
               />
               <StatTile label="Average GPU" value={percent(fleet.gpuAverage)} color="var(--series-gpu)" sub="across online nodes" />
+              {/* Decode is the headline because it is what a request waits on;
+                  prefill rides underneath rather than taking a tile of its own. */}
               <StatTile
                 label="Decode throughput"
                 value={tokensPerSecond(fleet.tokens)}
                 unit="tok/s"
                 color="var(--series-llm)"
-                sub="all inference servers"
+                sub={`${tokensPerSecond(fleet.prefill)} tok/s prefill`}
               />
               <StatTile label="Network" value={bytesPerSecond(fleet.network)} sub="combined rx + tx" />
             </section>
