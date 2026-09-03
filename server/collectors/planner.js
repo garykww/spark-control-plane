@@ -70,6 +70,14 @@ const num = (value) => {
   return Number.isFinite(n) ? n : null;
 };
 
+/* A 0-1 fraction. Separate from num() above, which is parseInt and would floor
+ * every one of these to 0. Anything outside the range is null rather than
+ * clamped: it did not come from a run this dashboard started. */
+const fraction = (value) => {
+  const n = Number.parseFloat(String(value ?? '').trim());
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : null;
+};
+
 /*
  * Status is derived on every poll rather than stored, because the node can
  * change it without the dashboard involved: the run can be killed, or the box
@@ -124,6 +132,15 @@ export function parseRuns(text, nowMs = Date.now()) {
       modelRepoId: String(meta.modelRepoId ?? ''),
       containerName: String(meta.containerName ?? ''),
       port: num(meta.port),
+      /* The fraction of TOTAL memory vLLM was told to claim. It reserves that
+       * as one block at startup and never gives it back, so for a run that is
+       * still serving it is the one honest figure for what that container is
+       * holding - nvidia-smi reports no per-process memory on unified hardware.
+       *
+       * NOT num(): everything else read here is a count and num() is parseInt,
+       * which turns 0.46 into 0 rather than into null - a value that reads as
+       * "no memory reserved" instead of as "unparseable". */
+      gpuMemoryUtilization: fraction(meta.gpuMemoryUtilization),
       /* The key is in the container's own argv anyway; surfacing it is what
        * makes the finished endpoint usable without reading `docker inspect`. */
       apiKey: String(meta.apiKey ?? '') || null,
@@ -157,4 +174,4 @@ export function parseRuns(text, nowMs = Date.now()) {
   return runs.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
 }
 
-export const EMPTY_PLANNER = { runs: [], plans: [] };
+export const EMPTY_PLANNER = { runs: [], plans: [], serving: [] };

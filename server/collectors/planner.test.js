@@ -152,3 +152,42 @@ test('every active status is one a phase can produce', () => {
   assert.equal(ACTIVE_RUN_STATUSES.has('failed'), false);
   assert.equal(deriveRunStatus({ cancelled: false, exitCode: null, alive: true, phase: 'wait' }), 'waiting');
 });
+
+/*
+ * The memory fraction survives the read as a decimal.
+ *
+ * Everything else in a run record is a count, and the shared reader is
+ * parseInt - which turns 0.46 into 0, a number that reads as "reserved
+ * nothing" rather than as "could not parse". That is what blanked every
+ * per-recipe slice on the memory bar.
+ */
+test('the memory fraction is read as a decimal, not floored to an integer', () => {
+  const meta = JSON.stringify({
+    recipeId: 'qwen38-27b-nvfp4-dflash2',
+    recipeName: 'Qwen3.8-27B · NVFP4 + DFlash2',
+    containerName: 'spark-run-qwen38-nvfp4-dflash2',
+    port: 8000,
+    gpuMemoryUtilization: 0.46,
+  });
+
+  const [run] = parseRuns(block(ID, { meta, phase: 'ready', exit: '0', started: '1788000000' }), NOW);
+  assert.equal(run.gpuMemoryUtilization, 0.46);
+});
+
+test('a fraction that is missing or out of range is null, never zero', () => {
+  const withValue = (value) =>
+    parseRuns(
+      block(ID, {
+        meta: JSON.stringify({ containerName: 'c', gpuMemoryUtilization: value }),
+        phase: 'ready',
+        exit: '0',
+      }),
+      NOW,
+    )[0].gpuMemoryUtilization;
+
+  for (const value of [undefined, null, 0, -0.5, 1.5, 'nonsense']) {
+    assert.equal(withValue(value), null, `expected null for ${JSON.stringify(value)}`);
+  }
+  /* The boundary is usable: vLLM accepts a fraction up to 1. */
+  assert.equal(withValue(1), 1);
+});

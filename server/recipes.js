@@ -605,6 +605,34 @@ export function contextOptions(recipe) {
 
 export const requestOptions = () => [...REQUEST_STEPS];
 
+/*
+ * The port the run publishes on the node, which is the recipe's unless the
+ * caller asks for another.
+ *
+ * A recipe declares a port because a serving configuration has a natural one,
+ * not because the node has to agree: 8000 may already be taken by something
+ * that has nothing to do with this catalogue, and before this the only answer
+ * was a blocker with no way past it. Only the HOST side moves - the container
+ * still listens on containerPort and the mapping absorbs the difference - so
+ * nothing in the recipe's own argv changes with it.
+ *
+ * `valid` is carried rather than thrown on, because this is reached from the
+ * pricing route on every keystroke: a half-typed port should price as a
+ * blocker the panel can explain, not as a 400 that blanks the panel.
+ */
+function resolvePort(recipe, requested = {}) {
+  const asked = requested.port;
+  if (asked === undefined || asked === null || asked === '') {
+    return { port: recipe.port, valid: true, overridden: false };
+  }
+
+  const port = Number(asked);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return { port: recipe.port, valid: false, overridden: true, asked };
+  }
+  return { port, valid: true, overridden: port !== recipe.port };
+}
+
 function resolveTuning(recipe, tuning = {}) {
   const ceiling = recipe.contextLength ?? CONTEXT_STEPS.at(-1);
   const wantedContext = Number(tuning.contextLength);
@@ -661,10 +689,98 @@ export function sizeFor(recipe, tuning) {
   };
 }
 
+/*
+ * The HOST port of a docker mapping. `docker ps` lists exposed-but-unpublished
+ * ports too ("8000/tcp" with no arrow) and those hold nothing on the host; the
+ * collector has already stripped the host IP, so the text before "->" is the
+ * host port and its absence means nothing was published.
+ */
+const publishedPort = (mapping) =>
+  mapping.includes('->') ? Number.parseInt(mapping, 10) : null;
+
+/*
+ * What each recipe that is currently up has taken off the machine.
+ *
+ * There is no measurement to be had: on unified hardware nvidia-smi reports no
+ * per-process memory, and `docker stats` is too slow for a 2s poll. But a vLLM
+ * server does not grow into memory - it claims gpuMemoryUtilization x TOTAL as
+ * one block at startup and never returns it, so that fraction IS what the
+ * container is holding. It is read from the run that started it, or failing
+ * that from the container's own command line, which survives the run record.
+ *
+ * A service declares a figure instead of reserving one, so its own number is
+ * used and marked as declared - it is a ceiling the container grows into, not
+ * something already taken.
+ *
+ * `reservedBytes` is null when neither source knows: a container started by
+ * hand with no fraction on its command line. The caller leaves those in the
+ * unattributed remainder rather than inventing a size for them.
+ */
+/* A usable memory fraction, or null. Guards both sources at the point of use,
+ * so a bad value from either one cannot be mistaken for a real reservation. */
+const valid = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : null;
+};
+
+export function servingRecipes(snapshot, runs = []) {
+  const pool = memoryPool(snapshot);
+  const containers = snapshot.containers ?? [];
+
+  return RECIPES.flatMap((recipe) => {
+    const container = containers.find(
+      (entry) => entry.name === recipe.containerName && entry.state === 'running',
+    );
+    if (!container) return [];
+
+    /* The run that started this container, if its record is still around. */
+    const run = runs.find((entry) => entry.containerName === recipe.containerName);
+
+    let reservedBytes = null;
+    let source = null;
+    if (recipe.runtime !== 'vllm') {
+      reservedBytes = recipe.memory.overheadBytes;
+      source = 'declared';
+    } else {
+      /*
+       * The run's own record first, then the container's command line. Chained
+       * on truthiness rather than nullishness on purpose: a fraction of zero is
+       * not a reading, it is a parse that failed, and it must fall through to
+       * the other source instead of standing as "reserved nothing".
+       */
+      const fromRun = valid(run?.gpuMemoryUtilization);
+      const fromContainer = valid(container.gpuMemoryUtilization);
+      const fraction = fromRun ?? fromContainer;
+      if (fraction && pool.totalBytes) {
+        reservedBytes = fraction * pool.totalBytes;
+        source = fromRun ? 'run' : 'container';
+      }
+    }
+
+    return [{
+      recipeId: recipe.id,
+      name: recipe.name,
+      runtime: recipe.runtime,
+      containerName: recipe.containerName,
+      modelRepoId: recipe.model?.repoId ?? recipe.weights[0]?.repoId ?? null,
+      containerId: container.id,
+      status: container.status,
+      port: container.ports.map(publishedPort).find((port) => Number.isInteger(port)) ?? null,
+      /* True once a run of its own describes it; false when all we have is the
+       * container. The panel says which, because one carries a bearer token and
+       * a phase history and the other carries neither. */
+      hasRun: Boolean(run),
+      reservedBytes,
+      reservedSource: source,
+    }];
+  });
+}
+
 export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
   const pool = memoryPool(snapshot);
   const isVllm = recipe.runtime === 'vllm';
   const tuning = resolveTuning(recipe, requested);
+  const chosen = resolvePort(recipe, requested);
   const size = sizeFor(recipe, tuning);
   const { weightsBytes, requiredBytes } = size;
 
@@ -731,15 +847,15 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
    * collector has already stripped the host IP, so the text before "->" is the
    * host port and its absence means nothing was published.
    */
-  const publishedPort = (mapping) =>
-    mapping.includes('->') ? Number.parseInt(mapping, 10) : null;
-
-  const portHolder = (snapshot.containers ?? []).find(
+  /* Only meaningful once there is a real port to check: an unusable one falls
+   * back to the recipe's, and reporting a conflict on a port the caller never
+   * asked for reads as two problems where there is one. */
+  const portHolder = !chosen.valid ? null : (snapshot.containers ?? []).find(
     (container) =>
       container.state === 'running' &&
       /* Re-running a recipe replaces its own container, so its own name is fine. */
       container.name !== recipe.containerName &&
-      container.ports.some((mapping) => publishedPort(mapping) === recipe.port),
+      container.ports.some((mapping) => publishedPort(mapping) === chosen.port),
   );
 
   const activeRun = runs.find((run) => ACTIVE_RUN_STATUSES.has(run.status));
@@ -768,10 +884,18 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
       message: `${activeRun.recipeName ?? 'another recipe'} is already being started on this node`,
     });
   }
+  if (!chosen.valid) {
+    blockers.push({
+      code: 'port-invalid',
+      message: `${chosen.asked} is not a usable port - it must be a whole number between 1 and 65535`,
+    });
+  }
   if (portHolder) {
     blockers.push({
       code: 'port',
-      message: `port ${recipe.port} is already published by "${portHolder.name}"`,
+      message:
+        `port ${chosen.port} is already published by "${portHolder.name}"` +
+        (chosen.overridden ? '' : ' - publish this run on another port, or stop that container'),
     });
   }
 
@@ -866,6 +990,10 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
   return {
     recipeId: recipe.id,
     fits: blockers.length === 0,
+    /* What this plan was priced and checked against, so the run publishes the
+     * same port the conflict check just cleared. */
+    port: chosen.port,
+    defaultPort: recipe.port,
     memory: {
       unified: pool.unified,
       weightsBytes,
@@ -909,7 +1037,11 @@ const formatTokens = (tokens) =>
 
 export function buildPlanner(snapshot, runs = []) {
   /* The baseline every browser first sees: each recipe at its own defaults. */
-  return { runs, plans: RECIPES.map((recipe) => planRecipe(recipe, snapshot, runs)) };
+  return {
+    runs,
+    plans: RECIPES.map((recipe) => planRecipe(recipe, snapshot, runs)),
+    serving: servingRecipes(snapshot, runs),
+  };
 }
 
 /*

@@ -10,6 +10,7 @@ import {
   recipeById,
   planRecipe,
   buildPlanner,
+  servingRecipes,
   memoryPool,
   cacheMount,
 } from './recipes.js';
@@ -248,6 +249,186 @@ test('the recipe’s own container does not block re-running it', () => {
     ],
   });
   assert.equal(plan(KEPT, node).fits, true);
+});
+
+/*
+ * The port is the one thing about a run that is the node's business rather than
+ * the recipe's: 8000 may be taken by something with nothing to do with this
+ * catalogue, and before the override that was a blocker with no way past it.
+ */
+test('an overridden port is what the conflict check uses', () => {
+  const node = roomyNode({
+    containers: [{ name: 'vllm-other', state: 'running', ports: ['8000->8000/tcp'] }],
+  });
+
+  /* On the recipe's own port, still blocked. */
+  assert.equal(plan(KEPT, node).fits, false);
+
+  /* Moved out of the way, it fits - and the plan reports where it will land. */
+  const moved = plan(KEPT, node, [], { port: 8001 });
+  assert.equal(moved.fits, true);
+  assert.equal(moved.port, 8001);
+  assert.equal(moved.defaultPort, 8000);
+});
+
+test('an override onto an occupied port is blocked by that port, not the default', () => {
+  const node = roomyNode({
+    containers: [{ name: 'comfyui-h3', state: 'running', ports: ['8188->8188/tcp'] }],
+  });
+
+  /* 8000 is free, so the recipe's own port is fine. */
+  assert.equal(plan(KEPT, node).fits, true);
+
+  const clash = plan(KEPT, node, [], { port: 8188 });
+  assert.equal(clash.fits, false);
+  assert.match(clash.blockers.find((b) => b.code === 'port').message, /port 8188 is already published/);
+});
+
+/* The pricing route re-plans on every keystroke, so a half-typed port has to
+ * come back as a blocker the panel can explain rather than as an exception. */
+test('an unusable port is a blocker, not a throw', () => {
+  /* Occupied on the recipe's own port, so the fallback would collide if the
+   * conflict check ran against it. */
+  const node = roomyNode({
+    containers: [{ name: 'vllm-other', state: 'running', ports: ['8000->8000/tcp'] }],
+  });
+
+  for (const port of [0, 70000, -1, 'eight thousand', 8000.5]) {
+    const entry = plan(KEPT, node, [], { port });
+    assert.equal(entry.fits, false, `expected ${port} to be refused`);
+    assert.ok(codes(entry.blockers).includes('port-invalid'), `expected port-invalid for ${port}`);
+    /* And it never reports a port it would not actually publish on. */
+    assert.equal(entry.port, 8000);
+    /* One problem, one blocker: the fallback port is not also conflict-checked. */
+    assert.ok(!codes(entry.blockers).includes('port'), `${port} reported a second port blocker`);
+  }
+});
+
+test('an omitted or empty port falls back to the recipe’s own', () => {
+  for (const port of [undefined, null, '']) {
+    const entry = plan(KEPT, roomyNode(), [], { port });
+    assert.equal(entry.port, 8000);
+    assert.equal(entry.fits, true);
+  }
+});
+
+/* A service has no serving flags to tune but publishes a port like anything
+ * else, so the override has to reach it too. */
+test('a service recipe takes a port override as well', () => {
+  const entry = plan('comfyui-minimax-h3', roomyNode(), [], { port: 9188 });
+  assert.equal(entry.port, 9188);
+  assert.equal(entry.defaultPort, 8188);
+  assert.equal(entry.tuning, null);
+});
+
+/*
+ * What a serving recipe has taken off the machine. There is nothing to measure
+ * - unified hardware reports no per-process memory - so the figure is the
+ * fraction vLLM was told to claim, which it takes as one block at startup.
+ */
+test('a serving recipe is sized from the run that started it', () => {
+  const node = roomyNode({
+    containers: [
+      { id: 'c1', name: 'spark-run-qwen38-nvfp4-dflash2', state: 'running', status: 'Up 3 hours', ports: ['8000->8000/tcp'] },
+    ],
+  });
+  const runs = [{ status: 'ready', containerName: 'spark-run-qwen38-nvfp4-dflash2', gpuMemoryUtilization: 0.5 }];
+
+  const [entry] = servingRecipes(node, runs);
+  assert.equal(entry.recipeId, KEPT);
+  assert.equal(entry.hasRun, true);
+  assert.equal(entry.port, 8000);
+  assert.equal(entry.reservedSource, 'run');
+  assert.equal(entry.reservedBytes, 0.5 * SPARK_MEMORY);
+});
+
+/* The record is swept eventually, and a container started by hand never had
+ * one - but the fraction is still on its own command line. */
+test('a serving recipe with no run falls back to the container’s own fraction', () => {
+  const node = roomyNode({
+    containers: [
+      {
+        id: 'c1',
+        name: 'spark-run-qwen38-nvfp4-dflash2',
+        state: 'running',
+        status: 'Up 25 hours',
+        ports: ['8000->8000/tcp'],
+        gpuMemoryUtilization: 0.64,
+      },
+    ],
+  });
+
+  const [entry] = servingRecipes(node, []);
+  assert.equal(entry.hasRun, false);
+  assert.equal(entry.reservedSource, 'container');
+  assert.equal(entry.reservedBytes, 0.64 * SPARK_MEMORY);
+});
+
+/*
+ * The regression that made every slice vanish: the run collector read the
+ * fraction with parseInt, so 0.46 arrived as 0. Nullish-coalescing then took
+ * that 0 over the container's own good value, and a falsy fraction reserved
+ * nothing - so a serving model reported no memory at all.
+ */
+test('a zero fraction from the run falls through to the container', () => {
+  const node = roomyNode({
+    containers: [
+      {
+        id: 'c1',
+        name: 'spark-run-qwen38-nvfp4-dflash2',
+        state: 'running',
+        status: 'Up 4 minutes',
+        ports: ['8000->8000/tcp'],
+        gpuMemoryUtilization: 0.46,
+      },
+    ],
+  });
+  const runs = [{ status: 'ready', containerName: 'spark-run-qwen38-nvfp4-dflash2', gpuMemoryUtilization: 0 }];
+
+  const [entry] = servingRecipes(node, runs);
+  assert.equal(entry.reservedSource, 'container');
+  assert.equal(entry.reservedBytes, 0.46 * SPARK_MEMORY);
+});
+
+/* Neither source knows: left unsized rather than guessed, so the panel folds it
+ * into the unattributed remainder instead of drawing a slice that is fiction. */
+test('a serving recipe nothing can size is reported without a figure', () => {
+  const node = roomyNode({
+    containers: [
+      { id: 'c1', name: 'spark-run-qwen38-nvfp4-dflash2', state: 'running', status: 'Up 1 hour', ports: [] },
+    ],
+  });
+
+  const [entry] = servingRecipes(node, []);
+  assert.equal(entry.reservedBytes, null);
+  assert.equal(entry.reservedSource, null);
+  assert.equal(entry.port, null);
+});
+
+test('a service declares its figure rather than reserving one', () => {
+  const node = roomyNode({
+    containers: [{ id: 'c2', name: 'comfyui-h3', state: 'running', status: 'Up 1 hour', ports: ['8188->8188/tcp'] }],
+  });
+
+  const [entry] = servingRecipes(node, []);
+  assert.equal(entry.recipeId, 'comfyui-minimax-h3');
+  assert.equal(entry.runtime, 'service');
+  assert.equal(entry.reservedSource, 'declared');
+  assert.equal(entry.reservedBytes, recipeById('comfyui-minimax-h3').memory.overheadBytes);
+});
+
+test('a stopped container is not serving, and the list rides the planner', () => {
+  const stopped = roomyNode({
+    containers: [{ id: 'c1', name: 'spark-run-qwen38-nvfp4-dflash2', state: 'exited', status: 'Exited (0)', ports: [] }],
+  });
+  assert.deepEqual(servingRecipes(stopped, []), []);
+
+  const up = roomyNode({
+    containers: [
+      { id: 'c1', name: 'spark-run-qwen38-nvfp4-dflash2', state: 'running', status: 'Up 2 hours', ports: ['8000->8000/tcp'], gpuMemoryUtilization: 0.4 },
+    ],
+  });
+  assert.equal(buildPlanner(up, []).serving.length, 1);
 });
 
 test('a run already in flight blocks every recipe', () => {

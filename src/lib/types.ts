@@ -257,6 +257,10 @@ export interface PlanIssue {
 export interface RecipePlan {
   recipeId: string;
   fits: boolean;
+  /* The host port this plan was priced and conflict-checked against - the
+   * recipe's own unless the port was overridden. */
+  port: number;
+  defaultPort: number;
   memory: {
     unified: boolean;
     weightsBytes: number;
@@ -315,9 +319,36 @@ export interface Run {
   finishedAt: number | null;
 }
 
+/*
+ * A recipe that is up right now, and what it has taken off the machine.
+ *
+ * `reservedBytes` is what its vLLM server claimed at startup
+ * (gpu-memory-utilization x total, held as one block and never returned), read
+ * from the run that started it or from the container's own command line. It is
+ * a reservation, not a measurement - unified hardware reports no per-process
+ * memory - and it is null when neither source knows.
+ */
+export interface ServingRecipe {
+  recipeId: string;
+  name: string;
+  runtime: 'vllm' | 'service';
+  containerName: string;
+  containerId: string;
+  modelRepoId: string | null;
+  /* The container's own `docker ps` status line, e.g. "Up 25 hours". */
+  status: string;
+  port: number | null;
+  /* False when the run record that started it is gone: no bearer token, no
+   * phase history, just the container. */
+  hasRun: boolean;
+  reservedBytes: number | null;
+  reservedSource: 'run' | 'container' | 'declared' | null;
+}
+
 export interface PlannerState {
   runs: Run[];
   plans: RecipePlan[];
+  serving: ServingRecipe[];
 }
 
 export interface SparkSpec {
