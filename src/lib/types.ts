@@ -116,6 +116,10 @@ export interface LlmStatus {
    * requests where the rates above sit at zero. */
   promptTokens: number | null;
   cachedTokens: number | null;
+  generatedTokens: number | null;
+  /* Cumulative engine time per phase, which the energy intervals diff. */
+  prefillSeconds: number | null;
+  decodeSeconds: number | null;
   /* Tokens over the trailing 10 minutes, as counter deltas. `complete` is false
    * while the window is still filling, so a partial span can be labelled as one. */
   window: {
@@ -124,6 +128,8 @@ export interface LlmStatus {
     decode: number;
     prefill: number;
     cached: number;
+    prefillSeconds: number;
+    decodeSeconds: number;
   } | null;
   running: number | null;
   queued: number | null;
@@ -378,6 +384,43 @@ export interface NodeSnapshot {
   storage: Mount[];
   network: Interface[];
   llm: LlmStatus[];
+  /* Null until the node has been polled with an inference endpoint reporting
+   * phase timings, and on any node whose GPU reports no power draw. */
+  energy: NodeEnergy | null;
+}
+
+/*
+ * One five-minute slice of energy accounting: the joules measured inside it and
+ * the tokens served inside it, so a cost is the division of two figures that
+ * describe the same minutes.
+ */
+export interface EnergyBucket {
+  startedAt: number;
+  endedAt: number;
+  wattHours: number;
+  meanWatts: number;
+  inputTokens: number;
+  cachedTokens: number;
+  outputTokens: number;
+  prefillSeconds: number;
+  decodeSeconds: number;
+}
+
+/*
+ * The inputs to a cost estimate. The server measures; the panel prices, so a
+ * tariff change costs a re-render rather than a re-poll.
+ *
+ * The watts here are the GPU rail alone - GB10 exposes no module-level sensor -
+ * which is why the panel adds an operator-supplied baseline for everything the
+ * rail cannot see.
+ */
+export interface NodeEnergy {
+  bucketSeconds: number;
+  measuredWatts: number;
+  /* Closed intervals, newest last. */
+  buckets: EnergyBucket[];
+  /* The interval still filling, kept out of the totals. */
+  current: EnergyBucket;
 }
 
 export interface Snapshot {

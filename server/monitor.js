@@ -63,6 +63,81 @@ const rate = (current, previous, seconds) => {
 const TOKEN_WINDOW_MS = 10 * 60 * 1000;
 
 /*
+ * Energy accounting in fixed intervals.
+ *
+ * Power is not a constant: the node idles at one draw and loads at another, and
+ * a single figure over a long window smears the two together. So each interval
+ * integrates the power actually sampled inside it - a Riemann sum over the poll
+ * cadence, not a mean times a span - and carries the token delta from the same
+ * interval. Cost per token is then a division of two figures that describe the
+ * same minutes, and a run of intervals shows how it moved.
+ */
+const ENERGY_BUCKET_MS = 5 * 60 * 1000;
+/* Twelve of them is an hour of history, which is enough to see a workload
+ * change without keeping a database. */
+const ENERGY_BUCKETS_KEPT = 12;
+
+const delta = (now, before) => {
+  /* A restarted model server rewinds its counters; count nothing rather than a
+   * negative, and the next interval resumes normally. */
+  const value = (now ?? 0) - (before ?? 0);
+  return value > 0 ? value : 0;
+};
+
+/*
+ * Folds one poll into the current interval, closing it when it is full.
+ *
+ * `state` is opaque to the caller: the open interval plus the previous sample's
+ * cumulative counters. Energy accrues as watts x the time since the last poll,
+ * so an irregular cadence or a skipped poll costs accuracy rather than
+ * correctness - the joules that were measured are the joules that are counted.
+ */
+export function advanceEnergyBuckets(state, sample, bucketMs = ENERGY_BUCKET_MS, keep = ENERGY_BUCKETS_KEPT) {
+  const previous = state?.previous ?? null;
+  const closed = state?.closed ?? [];
+
+  let open = state?.open ?? {
+    startedAt: sample.at,
+    endedAt: sample.at,
+    joules: 0,
+    inputTokens: 0,
+    cachedTokens: 0,
+    outputTokens: 0,
+    prefillSeconds: 0,
+    decodeSeconds: 0,
+  };
+
+  if (previous) {
+    const elapsed = (sample.at - previous.at) / 1000;
+    if (elapsed > 0 && Number.isFinite(sample.watts)) open.joules += sample.watts * elapsed;
+
+    open.endedAt = sample.at;
+    open.inputTokens += delta(sample.input, previous.input);
+    open.cachedTokens += delta(sample.cached, previous.cached);
+    open.outputTokens += delta(sample.output, previous.output);
+    open.prefillSeconds += delta(sample.prefillSeconds, previous.prefillSeconds);
+    open.decodeSeconds += delta(sample.decodeSeconds, previous.decodeSeconds);
+  }
+
+  let nextClosed = closed;
+  if (sample.at - open.startedAt >= bucketMs) {
+    nextClosed = [...closed, open].slice(-keep);
+    open = {
+      startedAt: sample.at,
+      endedAt: sample.at,
+      joules: 0,
+      inputTokens: 0,
+      cachedTokens: 0,
+      outputTokens: 0,
+      prefillSeconds: 0,
+      decodeSeconds: 0,
+    };
+  }
+
+  return { state: { open, closed: nextClosed, previous: sample }, closed: nextClosed, open };
+}
+
+/*
  * Adds one sample of an endpoint's cumulative counters and answers what was
  * served across the retained span.
  *
@@ -102,6 +177,9 @@ export function advanceTokenWindow(previous, sample, windowMs) {
       decode: sample.generated - oldest.generated,
       prefill: sample.prompt - oldest.prompt,
       cached: sample.cached - oldest.cached,
+      /* Engine time in each phase across the same span, for the energy split. */
+      prefillSeconds: sample.prefillSeconds - oldest.prefillSeconds,
+      decodeSeconds: sample.decodeSeconds - oldest.decodeSeconds,
     },
   };
 }
@@ -115,6 +193,9 @@ class NodeMonitor {
     this.previous = null;
     /* Cumulative token counters over TOKEN_WINDOW_MS, keyed by endpoint id. */
     this.tokenWindows = new Map();
+    /* Five-minute energy intervals, each pairing measured joules with the
+     * tokens served inside it. */
+    this.energyState = null;
     this.runner = null;
     this.timer = null;
     this.stopped = false;
@@ -155,6 +236,7 @@ class NodeMonitor {
       network: [],
       thermal: [],
       llm: [],
+      energy: null,
     };
   }
 
@@ -319,6 +401,9 @@ class NodeMonitor {
      * so the plan a browser sees is always consistent with the numbers beside
      * it, rather than being recomputed against a later reading in the UI.
      */
+    /* Energy and tokens over the same trailing window, which the panel prices. */
+    snapshot.energy = this.#energy(snapshot.llm, gpus[0]?.powerDraw, now);
+
     snapshot.planner = buildPlanner(snapshot, runs);
 
     /* Baseline for the next poll's rate calculations. */
@@ -470,6 +555,63 @@ class NodeMonitor {
    * Token throughput: prefer a rate the backend publishes directly, otherwise
    * diff its cumulative token counters across the interval.
    */
+  /*
+   * What the node spent and served, in five-minute intervals.
+   *
+   * This reports joules and tokens; the panel applies a price. Keeping the
+   * tariff out of here means changing it is a re-render rather than a re-poll,
+   * and it keeps this function to things that were actually measured.
+   *
+   * ONLY THE GPU RAIL IS MEASURED. On GB10 nvidia-smi reports no power limit
+   * and the platform exposes no module-level sensor - no hwmon rails, no
+   * powercap - so CPU, memory, storage and PSU losses are absent. The rail
+   * still varies with load, which is what makes per-interval integration worth
+   * doing; the missing baseline is roughly constant, so the panel adds it as a
+   * figure the operator reads off a plug meter once.
+   */
+  #energy(llm, watts, now) {
+    const cumulative = (pick) => llm.reduce((acc, entry) => acc + (pick(entry) ?? 0), 0);
+    const reporting = llm.some((entry) => entry.promptTokens !== null);
+
+    const { state, closed, open } = advanceEnergyBuckets(this.energyState, {
+      at: now,
+      watts,
+      /* Cached tokens are excluded from the input count deliberately: vLLM
+       * skips those blocks, so they consume none of the prefill time the cost
+       * is attributed by. */
+      input: cumulative((e) => e.promptTokens) - cumulative((e) => e.cachedTokens),
+      cached: cumulative((e) => e.cachedTokens),
+      output: cumulative((e) => e.generatedTokens),
+      prefillSeconds: cumulative((e) => e.prefillSeconds),
+      decodeSeconds: cumulative((e) => e.decodeSeconds),
+    });
+    this.energyState = state;
+
+    if (!reporting || !Number.isFinite(watts)) return null;
+
+    const bucket = (b) => ({
+      startedAt: b.startedAt,
+      endedAt: b.endedAt,
+      wattHours: b.joules / 3600,
+      /* The average draw across the interval, which is what varied. */
+      meanWatts: b.endedAt > b.startedAt ? b.joules / ((b.endedAt - b.startedAt) / 1000) : 0,
+      inputTokens: b.inputTokens,
+      cachedTokens: b.cachedTokens,
+      outputTokens: b.outputTokens,
+      prefillSeconds: b.prefillSeconds,
+      decodeSeconds: b.decodeSeconds,
+    });
+
+    return {
+      bucketSeconds: ENERGY_BUCKET_MS / 1000,
+      measuredWatts: watts,
+      /* Newest last. The open interval is reported separately so the panel can
+       * show it as still filling rather than mixing a partial into the totals. */
+      buckets: closed.map(bucket),
+      current: bucket(open),
+    };
+  }
+
   /* Tokens over the trailing window for one endpoint. The arithmetic is
    * advanceTokenWindow's; this only keeps the samples per endpoint. */
   #tokenWindow(id, counters, now) {
@@ -483,6 +625,8 @@ class NodeMonitor {
       generated: counters.generatedTokens ?? 0,
       prompt: counters.promptTokens ?? 0,
       cached: counters.cachedTokens ?? 0,
+      prefillSeconds: counters.prefillSeconds ?? 0,
+      decodeSeconds: counters.decodeSeconds ?? 0,
     }, TOKEN_WINDOW_MS);
 
     this.tokenWindows.set(id, samples);
@@ -547,6 +691,10 @@ class NodeMonitor {
          */
         promptTokens: counters?.promptTokens ?? null,
         cachedTokens: counters?.cachedTokens ?? null,
+        generatedTokens: counters?.generatedTokens ?? null,
+        /* Cumulative engine time per phase, which the energy intervals diff. */
+        prefillSeconds: counters?.prefillSeconds ?? null,
+        decodeSeconds: counters?.decodeSeconds ?? null,
         /* Tokens over the trailing window, or over however much of it has
          * been observed so far - `complete` distinguishes the two. */
         window,

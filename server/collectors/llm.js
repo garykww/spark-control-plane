@@ -103,6 +103,14 @@ export function readLlmCounters(metrics) {
      * publishes it; the other backends report nothing here and it stays null.
      */
     cachedTokens: firstOf(metrics, ['vllm:prompt_tokens_cached_total']),
+    /*
+     * How long the engine actually spent in each phase, cumulative. This is what
+     * makes an energy split defensible: prefill and decode cost wildly different
+     * amounts of time per token, so attributing power by token count would be
+     * fiction while attributing it by measured time is not.
+     */
+    prefillSeconds: firstOf(metrics, ['vllm:request_prefill_time_seconds_sum']),
+    decodeSeconds: firstOf(metrics, ['vllm:request_decode_time_seconds_sum']),
     kvCacheUsage: firstOf(metrics, [
       /* vLLM's V1 engine renamed this; the old name stays for older servers. */
       'vllm:kv_cache_usage_perc',

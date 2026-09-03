@@ -223,11 +223,48 @@ export function demoSnapshot(node, index = 0) {
           decode: Math.round(decodeRate * Math.min(t, 600)),
           prefill: Math.round(prefillRate * Math.min(t, 600)),
           cached: Math.round(prefillRate * 0.82 * Math.min(t, 600)),
+          /* Decode holds the engine far longer per token than prefill does,
+           * which is the whole shape of the energy split. */
+          prefillSeconds: Math.min(t, 600) * 0.06,
+          decodeSeconds: Math.min(t, 600) * 0.94,
         },
         running: decodeRate > 0 ? Math.round(clamp(decodeRate / 22, 1, 12)) : 0,
         queued: decodeRate > 90 ? Math.round(scaled(seed + 10, 9, t, 2, 3, 0, 9)) : 0,
         kvCacheUsage: decodeRate > 0 ? clamp(decodeRate / 190, 0, 0.95) : 0,
       },
     ],
+    /* The same shape the real path derives, so the energy panel has something
+     * to price without hardware: closed five-minute intervals whose draw moves
+     * with the synthetic load, plus the one still filling. */
+    energy: (() => {
+      const bucket = (index, endedAt) => {
+        const watts = 28 + (scaled(seed + 12 + index, 53, t - index * 300, 55, 40, 0, 100) / 100) * 130;
+        const out = Math.round(decodeRate * 300 * (0.6 + (index % 3) * 0.2));
+        return {
+          startedAt: endedAt - 300_000,
+          endedAt,
+          wattHours: (watts * 300) / 3600,
+          meanWatts: watts,
+          inputTokens: Math.round(out * 1.4),
+          cachedTokens: Math.round(out * 26),
+          outputTokens: out,
+          prefillSeconds: 18,
+          decodeSeconds: 282,
+        };
+      };
+
+      const closed = Math.min(12, Math.floor(t / 300));
+      const now = Date.now();
+      return {
+        bucketSeconds: 300,
+        measuredWatts: power,
+        buckets: Array.from({ length: closed }, (_, i) => bucket(closed - i, now - (closed - i) * 300_000)),
+        current: {
+          ...bucket(0, now),
+          startedAt: now - (t % 300) * 1000,
+          wattHours: (power * (t % 300)) / 3600,
+        },
+      };
+    })(),
   };
 }

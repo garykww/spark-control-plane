@@ -16,6 +16,7 @@ import {
 } from '../lib/format';
 import { Badge, Button, Card, CoreGrid, StatTile, StatusDot } from './ui';
 import { ContainersPanel } from './ContainersPanel';
+import { EnergyPanel } from './EnergyPanel';
 import { HuggingFacePanel } from './HuggingFacePanel';
 import { RunPlannerPanel } from './RunPlannerPanel';
 import { SmStatus } from './SmStatus';
@@ -401,6 +402,8 @@ export function NodeDetail({
           )}
         </Card>
       )}
+
+      {node.energy && <EnergyPanel energy={node.energy} />}
 
       <RunPlannerPanel
         node={node}
