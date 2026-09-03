@@ -45,6 +45,25 @@ function readPorts(raw) {
   return [...seen].slice(0, 8);
 }
 
+/*
+ * The memory fraction a vLLM container was started with, read out of its own
+ * command line - which `--no-trunc` above already gives us in full.
+ *
+ * This is how a container that has outlived its run record can still be sized:
+ * the run's meta.json is the better source, but it is swept eventually and a
+ * container started outside the dashboard never had one.
+ *
+ * ONLY the number is returned. The command line also carries `--api-key`, and
+ * the raw string is deliberately never put on a container object, because
+ * everything on one is serialised to the browser.
+ */
+function readUtilization(command) {
+  const match = /--gpu-memory-utilization[= ]([0-9.]+)/.exec(String(command ?? ''));
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) && value > 0 && value <= 1 ? value : null;
+}
+
 export function parseContainers(text) {
   const trimmed = String(text ?? '').trim();
   if (!trimmed) return { containers: [], error: null, available: false };
@@ -80,6 +99,7 @@ export function parseContainers(text) {
       state: readState(entry),
       status: String(entry.Status ?? ''),
       ports: readPorts(entry.Ports),
+      gpuMemoryUtilization: readUtilization(entry.Command),
       createdAt: String(entry.CreatedAt ?? ''),
     });
   }

@@ -716,6 +716,66 @@ const publishedPort = (mapping) =>
  * hand with no fraction on its command line. The caller leaves those in the
  * unattributed remainder rather than inventing a size for them.
  */
+/* A usable memory fraction, or null. Guards both sources at the point of use,
+ * so a bad value from either one cannot be mistaken for a real reservation. */
+const valid = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : null;
+};
+
+export function servingRecipes(snapshot, runs = []) {
+  const pool = memoryPool(snapshot);
+  const containers = snapshot.containers ?? [];
+
+  return RECIPES.flatMap((recipe) => {
+    const container = containers.find(
+      (entry) => entry.name === recipe.containerName && entry.state === 'running',
+    );
+    if (!container) return [];
+
+    /* The run that started this container, if its record is still around. */
+    const run = runs.find((entry) => entry.containerName === recipe.containerName);
+
+    let reservedBytes = null;
+    let source = null;
+    if (recipe.runtime !== 'vllm') {
+      reservedBytes = recipe.memory.overheadBytes;
+      source = 'declared';
+    } else {
+      /*
+       * The run's own record first, then the container's command line. Chained
+       * on truthiness rather than nullishness on purpose: a fraction of zero is
+       * not a reading, it is a parse that failed, and it must fall through to
+       * the other source instead of standing as "reserved nothing".
+       */
+      const fromRun = valid(run?.gpuMemoryUtilization);
+      const fromContainer = valid(container.gpuMemoryUtilization);
+      const fraction = fromRun ?? fromContainer;
+      if (fraction && pool.totalBytes) {
+        reservedBytes = fraction * pool.totalBytes;
+        source = fromRun ? 'run' : 'container';
+      }
+    }
+
+    return [{
+      recipeId: recipe.id,
+      name: recipe.name,
+      runtime: recipe.runtime,
+      containerName: recipe.containerName,
+      modelRepoId: recipe.model?.repoId ?? recipe.weights[0]?.repoId ?? null,
+      containerId: container.id,
+      status: container.status,
+      port: container.ports.map(publishedPort).find((port) => Number.isInteger(port)) ?? null,
+      /* True once a run of its own describes it; false when all we have is the
+       * container. The panel says which, because one carries a bearer token and
+       * a phase history and the other carries neither. */
+      hasRun: Boolean(run),
+      reservedBytes,
+      reservedSource: source,
+    }];
+  });
+}
+
 export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
   const pool = memoryPool(snapshot);
   const isVllm = recipe.runtime === 'vllm';
@@ -977,7 +1037,11 @@ const formatTokens = (tokens) =>
 
 export function buildPlanner(snapshot, runs = []) {
   /* The baseline every browser first sees: each recipe at its own defaults. */
-  return { runs, plans: RECIPES.map((recipe) => planRecipe(recipe, snapshot, runs)) };
+  return {
+    runs,
+    plans: RECIPES.map((recipe) => planRecipe(recipe, snapshot, runs)),
+    serving: servingRecipes(snapshot, runs),
+  };
 }
 
 /*

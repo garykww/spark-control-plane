@@ -10,6 +10,7 @@ import {
   recipeById,
   planRecipe,
   buildPlanner,
+  servingRecipes,
   memoryPool,
   cacheMount,
 } from './recipes.js';
@@ -318,6 +319,116 @@ test('a service recipe takes a port override as well', () => {
   assert.equal(entry.port, 9188);
   assert.equal(entry.defaultPort, 8188);
   assert.equal(entry.tuning, null);
+});
+
+/*
+ * What a serving recipe has taken off the machine. There is nothing to measure
+ * - unified hardware reports no per-process memory - so the figure is the
+ * fraction vLLM was told to claim, which it takes as one block at startup.
+ */
+test('a serving recipe is sized from the run that started it', () => {
+  const node = roomyNode({
+    containers: [
+      { id: 'c1', name: 'spark-run-qwen38-nvfp4-dflash2', state: 'running', status: 'Up 3 hours', ports: ['8000->8000/tcp'] },
+    ],
+  });
+  const runs = [{ status: 'ready', containerName: 'spark-run-qwen38-nvfp4-dflash2', gpuMemoryUtilization: 0.5 }];
+
+  const [entry] = servingRecipes(node, runs);
+  assert.equal(entry.recipeId, KEPT);
+  assert.equal(entry.hasRun, true);
+  assert.equal(entry.port, 8000);
+  assert.equal(entry.reservedSource, 'run');
+  assert.equal(entry.reservedBytes, 0.5 * SPARK_MEMORY);
+});
+
+/* The record is swept eventually, and a container started by hand never had
+ * one - but the fraction is still on its own command line. */
+test('a serving recipe with no run falls back to the container’s own fraction', () => {
+  const node = roomyNode({
+    containers: [
+      {
+        id: 'c1',
+        name: 'spark-run-qwen38-nvfp4-dflash2',
+        state: 'running',
+        status: 'Up 25 hours',
+        ports: ['8000->8000/tcp'],
+        gpuMemoryUtilization: 0.64,
+      },
+    ],
+  });
+
+  const [entry] = servingRecipes(node, []);
+  assert.equal(entry.hasRun, false);
+  assert.equal(entry.reservedSource, 'container');
+  assert.equal(entry.reservedBytes, 0.64 * SPARK_MEMORY);
+});
+
+/*
+ * The regression that made every slice vanish: the run collector read the
+ * fraction with parseInt, so 0.46 arrived as 0. Nullish-coalescing then took
+ * that 0 over the container's own good value, and a falsy fraction reserved
+ * nothing - so a serving model reported no memory at all.
+ */
+test('a zero fraction from the run falls through to the container', () => {
+  const node = roomyNode({
+    containers: [
+      {
+        id: 'c1',
+        name: 'spark-run-qwen38-nvfp4-dflash2',
+        state: 'running',
+        status: 'Up 4 minutes',
+        ports: ['8000->8000/tcp'],
+        gpuMemoryUtilization: 0.46,
+      },
+    ],
+  });
+  const runs = [{ status: 'ready', containerName: 'spark-run-qwen38-nvfp4-dflash2', gpuMemoryUtilization: 0 }];
+
+  const [entry] = servingRecipes(node, runs);
+  assert.equal(entry.reservedSource, 'container');
+  assert.equal(entry.reservedBytes, 0.46 * SPARK_MEMORY);
+});
+
+/* Neither source knows: left unsized rather than guessed, so the panel folds it
+ * into the unattributed remainder instead of drawing a slice that is fiction. */
+test('a serving recipe nothing can size is reported without a figure', () => {
+  const node = roomyNode({
+    containers: [
+      { id: 'c1', name: 'spark-run-qwen38-nvfp4-dflash2', state: 'running', status: 'Up 1 hour', ports: [] },
+    ],
+  });
+
+  const [entry] = servingRecipes(node, []);
+  assert.equal(entry.reservedBytes, null);
+  assert.equal(entry.reservedSource, null);
+  assert.equal(entry.port, null);
+});
+
+test('a service declares its figure rather than reserving one', () => {
+  const node = roomyNode({
+    containers: [{ id: 'c2', name: 'comfyui-h3', state: 'running', status: 'Up 1 hour', ports: ['8188->8188/tcp'] }],
+  });
+
+  const [entry] = servingRecipes(node, []);
+  assert.equal(entry.recipeId, 'comfyui-minimax-h3');
+  assert.equal(entry.runtime, 'service');
+  assert.equal(entry.reservedSource, 'declared');
+  assert.equal(entry.reservedBytes, recipeById('comfyui-minimax-h3').memory.overheadBytes);
+});
+
+test('a stopped container is not serving, and the list rides the planner', () => {
+  const stopped = roomyNode({
+    containers: [{ id: 'c1', name: 'spark-run-qwen38-nvfp4-dflash2', state: 'exited', status: 'Exited (0)', ports: [] }],
+  });
+  assert.deepEqual(servingRecipes(stopped, []), []);
+
+  const up = roomyNode({
+    containers: [
+      { id: 'c1', name: 'spark-run-qwen38-nvfp4-dflash2', state: 'running', status: 'Up 2 hours', ports: ['8000->8000/tcp'], gpuMemoryUtilization: 0.4 },
+    ],
+  });
+  assert.equal(buildPlanner(up, []).serving.length, 1);
 });
 
 test('a run already in flight blocks every recipe', () => {
