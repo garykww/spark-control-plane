@@ -257,6 +257,10 @@ export interface PlanIssue {
 export interface RecipePlan {
   recipeId: string;
   fits: boolean;
+  /* The host port this plan was priced and conflict-checked against - the
+   * recipe's own unless the port was overridden. */
+  port: number;
+  defaultPort: number;
   memory: {
     unified: boolean;
     weightsBytes: number;

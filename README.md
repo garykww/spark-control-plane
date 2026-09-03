@@ -316,6 +316,8 @@ Copy works over plain HTTP as well as HTTPS. `navigator.clipboard` needs a secur
 
 **Building images.** Recipes name a published image and pull it — building vLLM for aarch64 on the node would take hours and produce something less tested than the pinned image. A recipe that genuinely needs a derived image can declare `image.build`, and the same phase writes a Dockerfile on the node and builds it instead. The Qwen3-ASR recipe is the one that does: `vllm/vllm-openai` ships without vLLM's `audio` extra, and because the audio loaders degrade to placeholders rather than failing at import, the stock image would start, pass the readiness probe, and only fail on the first audio file. Its build adds four wheels on top of the pinned image and rebuilds nothing.
 
+**Publishing on another port.** Each recipe declares a port because a serving configuration has a natural one — 8000 for the vLLM recipes, 8188 for ComfyUI — but the node does not have to agree, and something unrelated may already hold it. The panel's **Publish on port** field overrides the host side of the mapping; the container still listens on its own port, so nothing about the model or its flags changes. The plan is re-priced and re-checked against whatever you type, so a port already taken comes back as a blocker naming the container holding it, and clearing the field hands the port back to the recipe.
+
 One run at a time per node: two recipes racing would fight over the same port, the same memory and possibly the same container name.
 
 ## Containers
