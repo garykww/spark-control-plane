@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import type { NodeSnapshot, Recipe, RecipePlan, Run, RunPhase } from '../lib/types';
 import { api, type RunTuning } from '../lib/api';
 import { bytes, duration, percent } from '../lib/format';
@@ -786,13 +787,25 @@ function RunProgress({
         {PHASES.map((phase, index) => {
           const done = run.status === 'ready' || (reached > -1 && index < reached);
           const current = reached === index && live;
+          /*
+           * Serving is a state the node is still in, not a step that finished.
+           * Styling it like the steps behind it made the one chip that says
+           * "this is up right now" look as spent as the download that preceded
+           * it - so it is held lit for as long as the container is running, and
+           * greys out only when the server is actually gone.
+           */
+          const holding = phase.key === 'ready' && serving;
           return (
             <li
               key={phase.key}
               className="rounded-md px-2 py-0.5 text-[10px] font-medium tracking-wide uppercase"
               style={{
-                background: current ? 'var(--series-power)' : 'var(--surface-2)',
-                color: current ? '#fff' : done ? 'var(--ink-secondary)' : 'var(--ink-muted)',
+                background: current
+                  ? 'var(--series-power)'
+                  : holding
+                    ? 'var(--status-good)'
+                    : 'var(--surface-2)',
+                color: current || holding ? '#fff' : done ? 'var(--ink-secondary)' : 'var(--ink-muted)',
               }}
             >
               {phase.label}
@@ -818,7 +831,9 @@ function RunProgress({
         </div>
       )}
 
-      {run.message && <p className="mt-2 truncate text-[11px] text-ink-muted">{run.message}</p>}
+      {run.message && (
+        <p className="mt-2 truncate text-[11px] text-ink-muted">{readable(run.message)}</p>
+      )}
 
       {stopped && (
         <p className="mt-2 text-[11px] text-ink-muted">
@@ -828,17 +843,17 @@ function RunProgress({
       )}
 
       {serving && run.port && (
-        <div className="mt-3 rounded-lg bg-surface-2 px-3 py-2 text-[11px] text-ink-secondary">
-          Serving on{' '}
-          <code className="text-ink">
-            http://{node.host?.hostname ?? node.name}:{run.port}/v1
-          </code>
-          {run.apiKey && (
-            <>
-              {' — clients must send '}
-              <code className="text-ink break-all">Authorization: Bearer {run.apiKey}</code>
-            </>
-          )}
+        <div className="mt-3 space-y-2 rounded-lg bg-surface-2 px-3 py-2 text-[11px] text-ink-secondary">
+          <div>
+            Serving on{' '}
+            <code className="text-ink">
+              http://{node.host?.hostname ?? node.name}:{run.port}/v1
+            </code>
+          </div>
+          {/* The key is masked by default: this panel is often on screen while
+              someone else is looking at it, and a bearer token that grants the
+              endpoint is not something to leave sitting in plain view. */}
+          {run.apiKey && <SecretField label="Bearer token" value={run.apiKey} />}
         </div>
       )}
     </div>
@@ -928,4 +943,173 @@ function ConfirmDialog({
       </div>
     </div>
   );
+}
+
+/*
+ * A secret shown on demand: masked, revealable, copyable.
+ *
+ * It is a real <input> rather than masked text so the value can be selected and
+ * copied by hand, which matters because the clipboard API is not always there
+ * to help. It needs a secure context, and this dashboard is routinely opened
+ * over plain HTTP on a LAN address - where `navigator.clipboard` is undefined.
+ * So copying falls back to selecting the field and asking the browser to copy
+ * the selection, and if even that is refused the text is left selected with a
+ * prompt to press the shortcut, which always works.
+ */
+function SecretField({ label, value }: { label: string; value: string }) {
+  const [revealed, setRevealed] = useState(false);
+  const [copied, setCopied] = useState<'copied' | 'select' | null>(null);
+  const ref = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(null), 2500);
+    return () => clearTimeout(timer);
+  }, [copied]);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied('copied');
+      return;
+    } catch {
+      /* No clipboard API, or permission refused - fall through to selecting. */
+    }
+
+    const field = ref.current;
+    if (!field) return;
+
+    /* Selecting needs the value visible; a masked field copies dots in some
+     * browsers. Revealing is the lesser evil when the alternative is a button
+     * that silently does nothing. */
+    setRevealed(true);
+    field.focus();
+    field.select();
+    setCopied(document.execCommand?.('copy') ? 'copied' : 'select');
+  };
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-ink-muted">{label}</span>
+      <input
+        ref={ref}
+        readOnly
+        type={revealed ? 'text' : 'password'}
+        value={value}
+        aria-label={label}
+        onFocus={(event) => event.currentTarget.select()}
+        className="min-w-0 flex-1 rounded border border-hairline bg-surface-0 px-2 py-1 font-mono text-[11px] text-ink outline-none focus:border-[color:var(--series-gpu)]"
+      />
+      {/* Icon-only, so the field keeps its width for the key itself. Each
+          carries a title and an aria-label, because an icon alone names
+          nothing to a screen reader or to someone who has not seen it before. */}
+      <IconButton
+        label={revealed ? 'Hide the token' : 'Show the token'}
+        onClick={() => setRevealed((on) => !on)}
+      >
+        {revealed ? <EyeOffIcon /> : <EyeIcon />}
+      </IconButton>
+      <IconButton
+        label={copied === 'copied' ? 'Copied' : 'Copy the token'}
+        active={copied === 'copied'}
+        onClick={copy}
+      >
+        {copied === 'copied' ? <CheckIcon /> : <CopyIcon />}
+      </IconButton>
+      {copied === 'select' && (
+        <span className="text-ink-muted">selected — press {shortcut()} to copy</span>
+      )}
+    </div>
+  );
+}
+
+/* The clipboard shortcut this browser's platform actually uses. */
+const shortcut = () =>
+  typeof navigator !== 'undefined' && /Mac|iP(hone|ad)/.test(navigator.platform ?? '')
+    ? '\u2318C'
+    : 'Ctrl+C';
+
+function IconButton({
+  label,
+  active,
+  onClick,
+  children,
+}: {
+  label: string;
+  active?: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      className={`inline-flex shrink-0 cursor-pointer items-center justify-center rounded border border-hairline p-1.5 transition-colors hover:bg-surface-1 hover:text-ink ${
+        active ? 'text-[color:var(--status-good)]' : 'text-ink-secondary'
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+/*
+ * 14px line icons drawn on a 24 grid, inheriting colour from the button so they
+ * follow the theme rather than pinning a fill of their own.
+ */
+const iconProps = {
+  width: 14,
+  height: 14,
+  viewBox: '0 0 24 24',
+  fill: 'none',
+  stroke: 'currentColor',
+  strokeWidth: 2,
+  strokeLinecap: 'round',
+  strokeLinejoin: 'round',
+  'aria-hidden': true,
+} as const;
+
+const EyeIcon = () => (
+  <svg {...iconProps}>
+    <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z" />
+    <circle cx="12" cy="12" r="3" />
+  </svg>
+);
+
+const EyeOffIcon = () => (
+  <svg {...iconProps}>
+    <path d="M10.6 6.2A9.9 9.9 0 0 1 12 6c6.4 0 10 6 10 6a17 17 0 0 1-3.2 3.9M6.2 6.6A17 17 0 0 0 2 12s3.6 7 10 7a9.6 9.6 0 0 0 4.3-1" />
+    <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+    <path d="m3 3 18 18" />
+  </svg>
+);
+
+const CopyIcon = () => (
+  <svg {...iconProps}>
+    <rect x="9" y="9" width="12" height="12" rx="2" />
+    <path d="M5 15V5a2 2 0 0 1 2-2h10" />
+  </svg>
+);
+
+const CheckIcon = () => (
+  <svg {...iconProps}>
+    <path d="m20 6-11 11-5-5" />
+  </svg>
+);
+
+/*
+ * The last line the node logged, made fit to read.
+ *
+ * The run script marks its phase headers with a leading "---" so they stand out
+ * in the log file; that marker is scaffolding for the log, not for a person
+ * reading one line of it in a panel. Strip it and capitalise, and leave
+ * everything after alone - the rest is repo ids, ports and error text, where a
+ * cleverer transformation would do damage.
+ */
+function readable(message: string) {
+  const text = message.replace(/^[\s-]+/, '').trim();
+  const first = text.charAt(0);
+  return first ? first.toUpperCase() + text.slice(1) : text;
 }
