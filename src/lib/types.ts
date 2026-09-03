@@ -107,6 +107,24 @@ export interface LlmStatus {
   latencyMs: number | null;
   decodeRate: number;
   prefillRate: number;
+  /* Prompt tokens served from the prefix cache. vLLM counts these inside its
+   * prompt-token total, so this is the part of prefillRate that cost nothing;
+   * cachedShare is the cumulative fraction, null when a backend never reports it. */
+  cachedRate: number;
+  cachedShare: number | null;
+  /* Cumulative counters. Prefill is bursty, so these stay informative between
+   * requests where the rates above sit at zero. */
+  promptTokens: number | null;
+  cachedTokens: number | null;
+  /* Tokens over the trailing 10 minutes, as counter deltas. `complete` is false
+   * while the window is still filling, so a partial span can be labelled as one. */
+  window: {
+    seconds: number;
+    complete: boolean;
+    decode: number;
+    prefill: number;
+    cached: number;
+  } | null;
   running: number | null;
   queued: number | null;
   kvCacheUsage: number | null;
@@ -380,6 +398,7 @@ export interface History {
   networkRx: number[];
   networkTx: number[];
   llmDecodeRate: number[];
+  llmPrefillRate: number[];
 }
 
 export type HistoryMap = Record<string, History>;

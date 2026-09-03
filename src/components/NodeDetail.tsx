@@ -10,6 +10,7 @@ import {
   percent,
   relativeTime,
   temperatureBand,
+  tokenCount,
   tokensPerSecond,
   watts,
 } from '../lib/format';
@@ -293,9 +294,27 @@ export function NodeDetail({
 
                 {llm.online ? (
                   <>
-                    <div className="mt-3 grid grid-cols-3 gap-3">
+                    <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
                       <StatTile label="Decode" value={tokensPerSecond(llm.decodeRate)} unit="tok/s" color="var(--series-llm)" />
-                      <StatTile label="Prefill" value={tokensPerSecond(llm.prefillRate)} unit="tok/s" />
+                      {/* Prefill arrives in bursts, so the rate is zero between
+                          requests - the running total says what has been processed. */}
+                      <StatTile
+                        label="Prefill"
+                        value={tokensPerSecond(llm.prefillRate)}
+                        unit="tok/s"
+                        color="var(--series-cpu)"
+                        sub={llm.promptTokens !== null ? `${tokenCount(llm.promptTokens)} total` : undefined}
+                      />
+                      {/* A total, not a rate: cached tokens move only when a request
+                          arrives, so a per-poll rate would read 0.0 nearly always.
+                          They are counted inside the prompt total above, so the share
+                          is how much of that prefill cost nothing. */}
+                      <StatTile
+                        label="Cached"
+                        value={tokenCount(llm.cachedTokens)}
+                        unit="tokens"
+                        sub={llm.cachedShare !== null ? `${percent(llm.cachedShare * 100)} of prompt tokens` : undefined}
+                      />
                       <StatTile label="Running" value={count(llm.running)} sub={llm.queued ? `${llm.queued} queued` : undefined} />
                     </div>
                     {llm.kvCacheUsage !== null && (
@@ -309,6 +328,34 @@ export function NodeDetail({
                         />
                       </div>
                     )}
+
+                    {/*
+                      * The card's footer line: what this server actually served
+                      * over the trailing window, from counter deltas rather than
+                      * the rates above. It answers "how much did this thing do",
+                      * which no instantaneous reading can - least of all prefill,
+                      * which sits at zero between requests. The span is named
+                      * rather than assumed, so a window still filling reads as
+                      * the time it really covers.
+                      */}
+                    {llm.window && (
+                      <div className="mt-3 flex flex-wrap items-baseline gap-x-3 gap-y-1 border-t border-hairline pt-2.5 text-[11px]">
+                        <span className="text-ink-muted">
+                          Last {llm.window.complete ? '10 min' : duration(llm.window.seconds)}
+                        </span>
+                        <span className="text-ink-secondary">
+                          Decode <span className="text-ink tabular">{tokenCount(llm.window.decode)}</span>
+                        </span>
+                        <span className="text-ink-muted">·</span>
+                        <span className="text-ink-secondary">
+                          Prefill <span className="text-ink tabular">{tokenCount(llm.window.prefill)}</span>
+                        </span>
+                        <span className="text-ink-muted">·</span>
+                        <span className="text-ink-secondary">
+                          Cached <span className="text-ink tabular">{tokenCount(llm.window.cached)}</span>
+                        </span>
+                      </div>
+                    )}
                   </>
                 ) : (
                   <p className="mt-2 text-[11px] text-ink-muted">{llm.error ?? 'no response'}</p>
@@ -317,17 +364,39 @@ export function NodeDetail({
             ))}
           </div>
 
-          {history && history.llmDecodeRate.some((v) => v > 0) && (
-            <div className="mt-4">
-              <div className="mb-2 text-[11px] tracking-wide text-ink-muted uppercase">Decode throughput</div>
-              <Sparkline
-                values={history.llmDecodeRate}
-                timestamps={history.timestamps}
-                color="var(--series-llm)"
-                height={56}
-                label="Decode throughput"
-                format={(v) => `${tokensPerSecond(v)} tok/s`}
-              />
+          {/*
+            * Two charts, not two series on one. They share a unit but not a
+            * scale: decode runs continuously at tens of tok/s while prefill
+            * arrives in bursts thousands wide, and on a shared y-axis one burst
+            * flattens the decode trace onto the floor. Separate charts let each
+            * hold its own domain. Both are drawn whenever either has data, so a
+            * prefill series sitting at zero reads as "no prompts arrived"
+            * rather than going missing.
+            */}
+          {history && [...history.llmDecodeRate, ...history.llmPrefillRate].some((v) => v > 0) && (
+            <div className="mt-4 space-y-4">
+              <div>
+                <div className="mb-2 text-[11px] tracking-wide text-ink-muted uppercase">Decode throughput</div>
+                <Sparkline
+                  values={history.llmDecodeRate}
+                  timestamps={history.timestamps}
+                  color="var(--series-llm)"
+                  height={56}
+                  label="Decode throughput"
+                  format={(v) => `${tokensPerSecond(v)} tok/s`}
+                />
+              </div>
+              <div>
+                <div className="mb-2 text-[11px] tracking-wide text-ink-muted uppercase">Prefill throughput</div>
+                <Sparkline
+                  values={history.llmPrefillRate}
+                  timestamps={history.timestamps}
+                  color="var(--series-cpu)"
+                  height={56}
+                  label="Prefill throughput"
+                  format={(v) => `${tokensPerSecond(v)} tok/s`}
+                />
+              </div>
             </div>
           )}
         </Card>

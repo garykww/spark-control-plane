@@ -27,6 +27,7 @@ const SERIES_KEYS = [
   'networkRx',
   'networkTx',
   'llmDecodeRate',
+  'llmPrefillRate',
 ] as const;
 
 const EMPTY_HISTORY = () => ({
@@ -40,6 +41,7 @@ const EMPTY_HISTORY = () => ({
   networkRx: [],
   networkTx: [],
   llmDecodeRate: [],
+  llmPrefillRate: [],
 });
 
 const sum = <T,>(items: T[], pick: (item: T) => number) =>
@@ -152,6 +154,7 @@ function appendHistory(history: HistoryMap, snapshot: Snapshot, limit: number): 
       networkRx: sum(node.network, (i) => i.rxRate),
       networkTx: sum(node.network, (i) => i.txRate),
       llmDecodeRate: sum(node.llm, (l) => l.decodeRate),
+      llmPrefillRate: sum(node.llm, (l) => l.prefillRate),
     };
 
     /*

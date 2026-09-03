@@ -36,6 +36,7 @@ export function demoSnapshot(node, index = 0) {
   const power = 28 + (gpuUtil / 100) * 185 + wander(seed + 3, 17, t) * 8;
 
   const decodeRate = gpuUtil > 12 ? scaled(seed + 4, 31, t, 48, 26, 0, 140) : 0;
+  const prefillRate = decodeRate > 0 ? decodeRate * scaled(seed + 9, 11, t, 9, 5, 1, 30) : 0;
 
   return {
     online: true,
@@ -207,7 +208,22 @@ export function demoSnapshot(node, index = 0) {
         error: null,
         latencyMs: Math.round(scaled(seed + 8, 7, t, 6, 4, 1, 40)),
         decodeRate,
-        prefillRate: decodeRate > 0 ? decodeRate * scaled(seed + 9, 11, t, 9, 5, 1, 30) : 0,
+        prefillRate,
+        /* Most of a realistic prefill is cache hits on a warm server, so the
+         * demo shows the same lopsided split the real counters do. */
+        cachedRate: prefillRate * 0.82,
+        cachedShare: decodeRate > 0 ? 0.82 : null,
+        /* Cumulative, so they climb for as long as the demo server has been up. */
+        promptTokens: Math.round(1.4e6 + t * 820),
+        cachedTokens: Math.round((1.4e6 + t * 820) * 0.82),
+        /* Fills over the first ten minutes, the same as a real window. */
+        window: {
+          seconds: Math.min(t, 600),
+          complete: t >= 600,
+          decode: Math.round(decodeRate * Math.min(t, 600)),
+          prefill: Math.round(prefillRate * Math.min(t, 600)),
+          cached: Math.round(prefillRate * 0.82 * Math.min(t, 600)),
+        },
         running: decodeRate > 0 ? Math.round(clamp(decodeRate / 22, 1, 12)) : 0,
         queued: decodeRate > 90 ? Math.round(scaled(seed + 10, 9, t, 2, 3, 0, 9)) : 0,
         kvCacheUsage: decodeRate > 0 ? clamp(decodeRate / 190, 0, 0.95) : 0,
