@@ -15,7 +15,7 @@ Each node gets a summary card on the Overview tab and a full page of its own:
 - **Unified memory** — on GB10 the CPU and GPU share one LPDDR5X pool, and the UI labels it as such instead of pretending there's separate VRAM
 - **CPU** — aggregate and per-core utilisation, load averages
 - **Storage and network** — per-mount capacity, per-interface throughput
-- **Inference** — auto-detects vLLM, llama.cpp, SGLang, TGI, and Ollama, then tracks decode/prefill tokens per second, queue depth, and KV cache usage
+- **Inference** — auto-detects vLLM, llama.cpp, SGLang, TGI, and Ollama, then tracks decode and prefill throughput, cached prompt tokens, queue depth, KV cache usage, and what the server actually served over the last ten minutes
 - **Containers** — every Docker container on the node, with start, stop, and restart buttons
 - **Model runs** — pick a serving recipe, tune its context and concurrency against the node's free memory, then let the dashboard fetch the weights, get the image, start the container and wait for it to serve
 - **HuggingFace cache** — cached models and datasets with sizes, plus download, delete, and space reclaim
@@ -41,6 +41,8 @@ DEMO_MODE=1 npm run dev
 ```
 
 Open <http://localhost:5173>. You should see three nodes with moving charts and a `DEMO DATA` badge in the header.
+
+Every screenshot in this README comes from demo mode, which is why the nodes are named `spark-demo-01` and friends.
 
 ## Run it for real
 
@@ -100,6 +102,8 @@ Set `SECRET_KEY` yourself if you rebuild containers without persisting `config/`
 
 ### The vault
 
+![the vault dialog](docs/vault.png)
+
 **Vault** in the header holds the secrets the control plane uses on your behalf, encrypted at rest like the SSH passwords. There is one entry today:
 
 | Secret | Used for |
@@ -131,6 +135,8 @@ browser ──WebSocket /ws──> Monitor ──> NodeMonitor (one per node)
 
 ## What "SM status" can and can't tell you
 
+![the GPU panel, with the SM status block beneath it](docs/gpu.png)
+
 There is **no per-SM telemetry available**. Neither NVML nor DCGM exposes individual streaming multiprocessors — `utilization.gpu` is the fraction of time at least one kernel was resident, averaged across the whole GPU. Per-SM counters exist only under a profiler (Nsight Compute / CUPTI `sm__*` metrics), which attaches to a single process, serialises kernels and adds heavy overhead. That is a profiling workflow, not something a dashboard can poll.
 
 So the **SM occupancy grid is a proportional view, not a hardware map**. It draws one cell per physical SM (48 on a GB10, read from the CUDA driver API) and fills as many as the current utilisation accounts for, coloured by which process owns the SM time. A lit cell means "one SM's worth of the machine is busy with this process" — it does not mean that particular SM is running. The panel says so on screen, because a grid that looked like per-SM truth would be the misleading part.
@@ -151,7 +157,55 @@ An idle GPU parks its clocks and briefly asserts a power-cap bit while doing so.
 
 If you want deeper counters — SM occupancy, tensor-core activity, achieved memory bandwidth — those need DCGM (`DCGM_FI_PROF_*` fields), which is a separate NVIDIA package and isn't wired up here.
 
+## Reading the inference panel
+
+![the inference panel](docs/inference.png)
+
+Point a node at an inference port and the panel identifies the server from its
+own responses — `/v1/models` for anything OpenAI-compatible, `/api/tags` for
+Ollama, `/metrics` for the Prometheus counters that name the backend. Most
+servers publish cumulative counters rather than rates, so throughput is derived
+by diffing them between polls, the same way network rates are.
+
+**Decode and prefill get separate charts**, not two lines on one. They share a
+unit and a time axis but nothing else: decode runs continuously at tens of
+tokens per second while a prefill burst is thousands wide, and on a shared
+y-axis one burst flattens the decode trace onto the floor.
+
+**Prefill and cached are shown as totals, not rates.** This is worth
+understanding, because a rate is the obvious choice and the wrong one:
+
+> Decode is continuous, so a per-poll derivative describes it well. Prefill is
+> not — it arrives in bursts, thousands of tokens in a fraction of a second,
+> then nothing for minutes. A derivative sampled every two seconds lands on a
+> zero almost every time, and the rare poll that catches a burst dilutes it
+> across the whole interval. A four-token prompt measured this way displays as
+> "1.5 tok/s".
+
+So prefill keeps its rate but carries a running total underneath, and the cached
+figure is a total with its share beside it.
+
+**Cached tokens are counted inside the prompt total**, which is why the share
+matters. vLLM skips cached blocks entirely — they never enter a forward pass —
+so prefill throughput includes work that was never done. On a long-running agent
+workload against a warm prefix cache, 94% of prompt tokens were cache hits: the
+server reported 12.99M prompt tokens of which 12.32M cost nothing.
+
+The line at the foot of each endpoint's card is what it served over the trailing
+ten minutes — the same span the charts cover. Those totals are counter
+differences rather than summed rates, so they are exact, they catch a burst that
+lands between two polls, and a skipped poll costs nothing. A restarted model
+server rewinds its counters, which restarts the window rather than reporting a
+negative total.
+
+Not every backend reports everything. Cached tokens are vLLM-only today, and a
+server with no `/metrics` endpoint still appears with its model list — the
+counts and the KV meter show a dash rather than a zero, since "not reported" and
+"nothing happened" are different claims.
+
 ## HuggingFace models
+
+![the HuggingFace cache panel](docs/huggingface.png)
 
 The node detail page lists every model and dataset in the node's HuggingFace cache, largest first, with a type filter and the total. On a Spark this is usually the biggest thing on the disk — 588 GB across 28 repos on the machine this was built against.
 
@@ -174,6 +228,8 @@ Sizes come from `hf` itself, which reports in decimal units (a repo `du` measure
 ## Model runs
 
 The node detail page lists a set of **recipes** — whole serving configurations, not templates with blanks. Each one names its weights, its image and every vLLM flag it will serve with. Pick one that fits and press **Run this recipe**; the node then downloads the weights, pulls the image, starts the container, and waits until the served endpoint actually answers.
+
+![picking a recipe and pricing it against the node's free memory](docs/model-runs.png)
 
 The catalogue ships four, each a port of a reference launcher:
 
@@ -245,11 +301,15 @@ So the planner works out the *smallest* fraction that covers the context and con
 
 **The run itself.** Like a HuggingFace download, it runs *detached on the node*: closing the page, restarting the dashboard or dropping the SSH connection doesn't touch it. Progress arrives on the normal poll as a phase — Weights, Image, Container, Loading, Serving — with a byte count during the download, which is the only phase with a total to divide by. **Cancel** kills the whole sequence and removes any container it had already started; **Stop server** takes down a finished one.
 
-A run reaches "Serving" only after the endpoint answers a real request, not merely when the container starts. The key it is serving behind — the vault's `VLLM_API_KEY` if one is set, otherwise the one this run minted — is shown alongside the URL:
+A run reaches "Serving" only after the endpoint answers a real request, not merely when the container starts. That step then stays lit for as long as the container is up, and greys out when the server is gone — the run's own exit code only says what was true when the script finished, so "is it still serving" is answered from `docker ps` on the current poll.
+
+The key it serves behind — the vault's `VLLM_API_KEY` if one is set, otherwise the one this run minted — appears beside the URL, masked. One icon reveals it, another copies it:
 
 ```
 Authorization: Bearer sk-...
 ```
+
+Copy works over plain HTTP as well as HTTPS. `navigator.clipboard` needs a secure context, which a LAN address is not, so the button falls back to selecting the field and asking the browser to copy the selection — and if that is refused too, it leaves the key selected and names the keyboard shortcut. The field is a real input throughout, so selecting it by hand always works.
 
 > **Warning**: the server is published on all interfaces, matching the reference script's default. On a trusted network that is what makes it reachable from your other machines; the API key is the only thing in front of it.
 
@@ -258,6 +318,8 @@ Authorization: Bearer sk-...
 One run at a time per node: two recipes racing would fight over the same port, the same memory and possibly the same container name.
 
 ## Containers
+
+![the container list](docs/containers.png)
 
 The node detail page lists every container `docker ps -a` reports, running ones first, and gives you **Start**, **Stop**, and **Restart** on each row. Stopping asks for confirmation first.
 
