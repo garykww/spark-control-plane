@@ -231,7 +231,7 @@ The node detail page lists a set of **recipes** — whole serving configurations
 
 ![picking a recipe and pricing it against the node's free memory](docs/model-runs.png)
 
-The catalogue ships four, each a port of a reference launcher:
+The catalogue ships five — four ported from a reference launcher, one built from the model's own config:
 
 | Recipe | From | Figures |
 | --- | --- | --- |
@@ -239,6 +239,7 @@ The catalogue ships four, each a port of a reference launcher:
 | **Qwen3.6-35B-A3B · NVFP4 + DFlash** | `serve-qwen36-35b-a3b-dflash.sh` | Weights measured on the node, KV derived from its `config.json`; the overhead figure is an estimate, and the panel labels it |
 | **DiffusionGemma-26B-A4B · NVFP4** | `serve-diffusiongemma-26b-a4b.sh` | Measured, off a real startup log for this model on the node |
 | **ComfyUI · MiniMax H3** | `run-comfyui-h3-spark.sh` | Measured on a GB10; a `service` recipe, so no KV cache and nothing to tune |
+| **Qwen3-ASR-1.7B · BF16** | [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) | Weights measured off the Hub, KV derived from `config.json`, overhead estimated; the only recipe that *builds* its image |
 
 Add your own by appending to the list.
 
@@ -313,7 +314,7 @@ Copy works over plain HTTP as well as HTTPS. `navigator.clipboard` needs a secur
 
 > **Warning**: the server is published on all interfaces, matching the reference script's default. On a trusted network that is what makes it reachable from your other machines; the API key is the only thing in front of it.
 
-**Building images.** Every bundled recipe names a published image and pulls it — building vLLM for aarch64 on the node would take hours and produce something less tested than the pinned image. A recipe that genuinely needs a derived image (a patched kernel, an extra wheel) can declare `image.build`, and the same phase writes a Dockerfile on the node and builds it instead.
+**Building images.** Recipes name a published image and pull it — building vLLM for aarch64 on the node would take hours and produce something less tested than the pinned image. A recipe that genuinely needs a derived image can declare `image.build`, and the same phase writes a Dockerfile on the node and builds it instead. The Qwen3-ASR recipe is the one that does: `vllm/vllm-openai` ships without vLLM's `audio` extra, and because the audio loaders degrade to placeholders rather than failing at import, the stock image would start, pass the readiness probe, and only fail on the first audio file. Its build adds four wheels on top of the pinned image and rebuilds nothing.
 
 One run at a time per node: two recipes racing would fight over the same port, the same memory and possibly the same container name.
 
