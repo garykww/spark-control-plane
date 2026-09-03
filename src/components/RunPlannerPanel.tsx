@@ -447,6 +447,15 @@ function RecipeDetail({
         </p>
       )}
 
+      {/* Published separately from the knobs above because it changes nothing
+          about the model: only the host side of the port mapping moves, so the
+          memory figure and the argv are the same whatever is typed here. */}
+      <PortField
+        value={tuning.port ?? plan.port}
+        defaultPort={plan.defaultPort}
+        onChange={(port) => onTune({ port })}
+      />
+
       {pricing && <p className="mt-2 text-[11px] text-ink-muted">pricing…</p>}
 
       {/* The bar above shows the shape; this is the arithmetic behind it. */}
@@ -467,7 +476,7 @@ function RecipeDetail({
         ) : (
           <>
             <Fact label="Reserves" value={bytes(plan.memory.requiredBytes)} />
-            <Fact label="Port" value={String(recipe.port)} />
+            <Fact label="Port" value={String(plan.port)} />
             <Fact
               label="To download"
               value={plan.disk.downloadBytes > 0 ? bytes(plan.disk.downloadBytes) : 'nothing'}
@@ -602,6 +611,55 @@ function Fact({ label, value }: { label: string; value: string }) {
 
 const formatTokens = (tokens: number) =>
   tokens >= 1e6 ? `${(tokens / 1e6).toFixed(1)}M` : `${Math.round(tokens / 1000)}K`;
+
+/*
+ * The host port the run publishes on.
+ *
+ * A free-text number rather than a slider: unlike context and concurrency there
+ * is no set of sensible steps, only whatever is free on this node. It is
+ * re-priced like any other setting, so a port already taken comes back as the
+ * planner's own blocker rather than being validated twice.
+ *
+ * Clearing the field hands the port back to the recipe instead of leaving the
+ * run with no port at all, which is why empty is null and not 0.
+ */
+function PortField({
+  value,
+  defaultPort,
+  onChange,
+}: {
+  value: number;
+  defaultPort: number;
+  onChange: (port: number | null) => void;
+}) {
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
+      <label className="text-ink-muted" htmlFor="run-port">
+        Publish on port
+      </label>
+      <input
+        id="run-port"
+        type="number"
+        min={1}
+        max={65535}
+        value={value}
+        onChange={(e) => onChange(e.target.value === '' ? null : Number(e.target.value))}
+        className="w-24 rounded-lg border border-hairline bg-surface-0 px-2 py-1 text-[12px] text-ink tabular outline-none focus:border-[color:var(--series-gpu)]"
+      />
+      {value === defaultPort ? (
+        <span className="text-ink-muted">the recipe's own port</span>
+      ) : (
+        <button
+          type="button"
+          className="text-ink-muted underline underline-offset-2 hover:text-ink-secondary"
+          onClick={() => onChange(null)}
+        >
+          back to {defaultPort}
+        </button>
+      )}
+    </div>
+  );
+}
 
 /*
  * A labelled slider over a fixed list of choices.
@@ -918,7 +976,7 @@ function ConfirmDialog({
           ) : (
             <>
               <Fact label="Reserves" value={bytes(plan.memory.requiredBytes)} />
-              <Fact label="Port" value={String(recipe.port)} />
+              <Fact label="Port" value={String(plan.port)} />
               <Fact label="Web UI" value="no auth" />
             </>
           )}
@@ -927,7 +985,7 @@ function ConfirmDialog({
         {/* What stands in front of the port this opens. A service brings no
             authentication of its own, so saying "an API key" would be wrong. */}
         <p className="mt-3 text-[11px] text-ink-muted">
-          The server is published on port {recipe.port} of every interface,{' '}
+          The server is published on port {plan.port} of every interface,{' '}
           {recipe.runtime === 'vllm'
             ? `protected only by an API key — ${sharedApiKey ? 'the one stored in the vault' : 'one generated for this run'}`
             : 'with no authentication in front of it'}

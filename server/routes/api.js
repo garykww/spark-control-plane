@@ -251,10 +251,14 @@ api.get('/recipes', (req, res) => {
 
 /* Reads the tuning knobs off a request body. Every one is optional; the plan
  * falls back to the recipe's own defaults for whatever is missing. */
-const tuningFrom = (body) => ({
+/* Everything a caller may ask for about a run: the three tuning knobs, and the
+ * host port to publish it on. Plucked field by field rather than passed
+ * through, so an unexpected key in the body cannot reach the planner. */
+const requestedFrom = (body) => ({
   contextLength: body?.contextLength,
   maxRequests: body?.maxRequests,
   gpuMemoryUtilization: body?.gpuMemoryUtilization,
+  port: body?.port,
 });
 
 /*
@@ -272,7 +276,7 @@ api.post('/nodes/:id/plan', route(async (req, res) => {
   if (!snapshot) throw new ValidationError('this node has not been polled yet');
 
   res.json({
-    plan: planRecipe(recipe, snapshot, snapshot.planner?.runs ?? [], tuningFrom(req.body)),
+    plan: planRecipe(recipe, snapshot, snapshot.planner?.runs ?? [], requestedFrom(req.body)),
   });
 }));
 
@@ -289,16 +293,17 @@ api.post('/nodes/:id/runs', route(async (req, res) => {
   const snapshot = monitor.snapshotFor(req.params.id);
   if (!snapshot) throw new ValidationError('this node has not been polled yet');
 
-  const plan = planRecipe(recipe, snapshot, snapshot.planner?.runs ?? [], tuningFrom(req.body));
+  const plan = planRecipe(recipe, snapshot, snapshot.planner?.runs ?? [], requestedFrom(req.body));
   if (!plan.fits) {
     throw new ValidationError(`${recipe.name} cannot run on ${node.name}: ${plan.blockers[0].message}`);
   }
 
-  /* The plan's own resolved tuning, not the request body: the memory fraction
-   * is computed against a live reading and is not a caller's to assert. */
+  /* The plan's own resolved tuning and port, not the request body: the memory
+   * fraction is computed against a live reading and is not a caller's to
+   * assert, and the port is the one the conflict check above just cleared. */
   const result = await startRun(node, {
     recipeId: recipe.id,
-    port: req.body?.port,
+    port: plan.port,
     tuning: plan.tuning,
   });
   monitor.refreshSoon(req.params.id);
