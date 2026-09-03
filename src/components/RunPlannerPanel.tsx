@@ -93,9 +93,26 @@ export function RunPlannerPanel({ node, recipes, error, sharedApiKey, onResult }
     };
   }, [node.nodeId, selected, tuning]);
 
-  /* The newest run is the only one worth a panel of its own; older ones are
-   * swept off the node after a day. */
-  const run = node.planner.runs[0] ?? null;
+  /*
+   * Every run worth a card of its own: whatever is in flight, whatever is still
+   * serving, and the newest regardless so a run that failed without leaving a
+   * container is still visible. Spent ones are swept off the node after a day.
+   *
+   * This used to be the newest run alone, which was right while a node could
+   * only serve one model - a new run replaced the previous container, so the
+   * newest run WAS the state of the node. Now that a run can publish a port of
+   * its own, an earlier recipe can still be serving behind a later one, and
+   * showing only the newest made the first look like it had disappeared.
+   */
+  const visibleRuns = node.planner.runs.filter(
+    (entry, index) =>
+      index === 0 ||
+      isLive(entry.status) ||
+      node.containers.some((c) => c.name === entry.containerName && c.state === 'running'),
+  );
+  /* Starting is serialised on the node, so any run in flight disables the
+   * button - not just the newest one. */
+  const launching = node.planner.runs.some((entry) => isLive(entry.status));
   const fitCount = node.planner.plans.filter((plan) => plan.fits).length;
 
   const selectedRecipe = selected ? (recipeById.get(selected) ?? null) : null;
@@ -153,7 +170,9 @@ export function RunPlannerPanel({ node, recipes, error, sharedApiKey, onResult }
     >
       <MachineMemory node={node} plan={activePlan} pricing={pricing} />
 
-      {run && <RunProgress node={node} run={run} busy={busy} act={act} />}
+      {visibleRuns.map((entry) => (
+        <RunProgress key={entry.id} node={node} run={entry} busy={busy} act={act} />
+      ))}
 
       <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         {recipes.map((recipe) => {
@@ -178,7 +197,7 @@ export function RunPlannerPanel({ node, recipes, error, sharedApiKey, onResult }
           plan={activePlan}
           tuning={tuning}
           pricing={pricing}
-          busy={busy !== null || Boolean(run && isLive(run.status))}
+          busy={busy !== null || launching}
           onTune={(next) => setTuning((current) => ({ ...current, ...next }))}
           onRun={() => setPending({ recipe: selectedRecipe, plan: activePlan, tuning })}
         />

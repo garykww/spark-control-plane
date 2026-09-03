@@ -444,6 +444,32 @@ export function apiKeyFor(recipe) {
   return getSecret('VLLM_API_KEY') ?? `sk-${crypto.randomBytes(24).toString('hex')}`;
 }
 
+/*
+ * Sweeps finished runs so the poll's list stays short - but never one whose
+ * container is still up.
+ *
+ * A run ENDS when the endpoint first answers; the container it started outlives
+ * it. Age alone used to be enough to discard the record, because a new run
+ * replaced the previous container anyway - there was only ever one server. Now
+ * that a run can publish a port of its own, an earlier recipe can still be
+ * serving when a later one starts, and its directory is the only record of
+ * where it is serving and of the key it minted. Deleting that while it serves
+ * loses both, and makes a model that is still up look like it vanished.
+ *
+ * So: finished, a day old, AND its container gone. `docker ps` is read once
+ * rather than per run. If docker cannot be reached the list is empty and this
+ * falls back to sweeping on age alone, which is what it did before.
+ */
+export const SWEEP_FINISHED_RUNS =
+  `UP="$(docker ps --format '{{.Names}}' 2>/dev/null)"; ` +
+  `for r in ${RUNS_DIR}/run-*/; do ` +
+  `[ -f "$r/exit" ] || continue; ` +
+  `[ -n "$(find "$r" -maxdepth 0 -mmin +1440 2>/dev/null)" ] || continue; ` +
+  `c="$(cat "$r/container" 2>/dev/null)"; ` +
+  `[ -n "$c" ] && printf '%s\\n' "$UP" | grep -qxF "$c" && continue; ` +
+  `rm -rf "$r"; ` +
+  `done 2>/dev/null;`;
+
 export async function startRun(node, { recipeId, port, tuning } = {}) {
   const recipe = recipeById(recipeId);
 
@@ -487,9 +513,7 @@ export async function startRun(node, { recipeId, port, tuning } = {}) {
     `printf %s '${b64(script)}' | base64 -d > "$D/run.sh" && ` +
     `printf %s '${b64(meta)}' | base64 -d > "$D/meta.json" && ` +
     `setsid nohup sh "$D/run.sh" </dev/null >/dev/null 2>&1 & ` +
-    /* Sweep finished runs older than a day so the poll's list stays short. */
-    `find ${RUNS_DIR} -maxdepth 1 -type d -name 'run-*' -mmin +1440 ` +
-    `-exec sh -c '[ -f "$1/exit" ] && rm -rf "$1"' _ {} \\; 2>/dev/null; ` +
+    `${SWEEP_FINISHED_RUNS} ` +
     `echo launched`;
 
   return withRunner(node, async (runner) => {

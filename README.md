@@ -318,7 +318,7 @@ Copy works over plain HTTP as well as HTTPS. `navigator.clipboard` needs a secur
 
 **Publishing on another port.** Each recipe declares a port because a serving configuration has a natural one — 8000 for the vLLM recipes, 8188 for ComfyUI — but the node does not have to agree, and something unrelated may already hold it. The panel's **Publish on port** field overrides the host side of the mapping; the container still listens on its own port, so nothing about the model or its flags changes. The plan is re-priced and re-checked against whatever you type, so a port already taken comes back as a blocker naming the container holding it, and clearing the field hands the port back to the recipe.
 
-One run at a time per node: two recipes racing would fight over the same port, the same memory and possibly the same container name.
+One run at a time per node — two *starts* racing would fight over the same memory and possibly the same container name. That limit is on starting, not on serving: once a run is ready its container keeps going, so a second recipe on a free port can serve alongside it if there is memory for both.
 
 ## Containers
 
