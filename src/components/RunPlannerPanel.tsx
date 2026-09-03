@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import type { NodeSnapshot, Recipe, RecipePlan, Run, RunPhase } from '../lib/types';
+import type { NodeSnapshot, Recipe, RecipePlan, Run, RunPhase, ServingRecipe } from '../lib/types';
 import { api, type RunTuning } from '../lib/api';
 import { bytes, duration, percent } from '../lib/format';
 import { Badge, Button, Card, StatusDot } from './ui';
@@ -113,6 +113,18 @@ export function RunPlannerPanel({ node, recipes, error, sharedApiKey, onResult }
   /* Starting is serialised on the node, so any run in flight disables the
    * button - not just the newest one. */
   const launching = node.planner.runs.some((entry) => isLive(entry.status));
+
+  /*
+   * What is up right now, and what each one has taken. Computed on the node -
+   * see servingRecipes() - because sizing a container means knowing the memory
+   * fraction it was started with, which is read from the run record or from the
+   * container's own command line, and that line also carries its API key.
+   */
+  const serving = node.planner.serving ?? [];
+  /* Only those with no run of their own get a card here; the rest are already
+   * described by a run card above, with their phase trail and token. */
+  const adopted = serving.filter((entry) => !entry.hasRun);
+
   const fitCount = node.planner.plans.filter((plan) => plan.fits).length;
 
   const selectedRecipe = selected ? (recipeById.get(selected) ?? null) : null;
@@ -168,10 +180,36 @@ export function RunPlannerPanel({ node, recipes, error, sharedApiKey, onResult }
         </span>
       }
     >
-      <MachineMemory node={node} plan={activePlan} pricing={pricing} />
+      <MachineMemory
+        node={node}
+        plan={activePlan}
+        pricing={pricing}
+        serving={serving}
+        recipes={recipes}
+        selectedId={selected}
+      />
 
       {visibleRuns.map((entry) => (
-        <RunProgress key={entry.id} node={node} run={entry} busy={busy} act={act} />
+        <RunProgress
+          key={entry.id}
+          node={node}
+          run={entry}
+          color={recipeColor(recipes, entry.recipeId)}
+          busy={busy}
+          act={act}
+        />
+      ))}
+
+      {adopted.map((entry) => (
+        <ServingContainer
+          key={entry.containerId}
+          node={node}
+          serving={entry}
+          color={recipeColor(recipes, entry.recipeId)}
+          sharedApiKey={sharedApiKey}
+          busy={busy}
+          act={act}
+        />
       ))}
 
       <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
@@ -183,6 +221,7 @@ export function RunPlannerPanel({ node, recipes, error, sharedApiKey, onResult }
               key={recipe.id}
               recipe={recipe}
               plan={plan}
+              color={recipeColor(recipes, recipe.id)}
               selected={selected === recipe.id}
               onSelect={() => setSelected(selected === recipe.id ? null : recipe.id)}
             />
@@ -228,10 +267,16 @@ function MachineMemory({
   node,
   plan,
   pricing,
+  serving,
+  recipes,
+  selectedId,
 }: {
   node: NodeSnapshot;
   plan: RecipePlan | null;
   pricing: boolean;
+  serving: ServingRecipe[];
+  recipes: Recipe[];
+  selectedId: string | null;
 }) {
   const total = plan?.memory.totalBytes ?? node.memory?.total ?? null;
   const available = plan?.memory.availableBytes ?? node.memory?.available ?? null;
@@ -243,28 +288,65 @@ function MachineMemory({
   const claimed = needs + spare;
   const over = Math.max(0, inUse + claimed - total);
 
-  const segments: MemorySegment[] = [
-    {
-      key: 'in-use',
-      label: plan ? 'Already in use' : 'In use',
-      bytes: inUse,
-      color: 'var(--series-memory)',
-    },
-  ];
+  /*
+   * The in-use portion, broken down by which model reserved it.
+   *
+   * Only servers whose reservation is known can be named; the rest of what the
+   * machine reports as used - the OS, anything not from this catalogue, and any
+   * container we could not size - stays in one neutral remainder. Named in
+   * catalogue order so a colour keeps its meaning as containers come and go.
+   */
+  const attributed = serving.filter((entry) => (entry.reservedBytes ?? 0) > 0);
+  const reserved = attributed.reduce((sum, entry) => sum + (entry.reservedBytes ?? 0), 0);
+  /*
+   * A reservation is a budget, not a resident-set reading: vLLM claims its
+   * fraction up front but on unified memory need not touch all of it, so the
+   * claims can add up to more than the kernel reports in use. Clamping keeps
+   * the bar honest about the total; the footnote says when it happened rather
+   * than quietly shrinking someone's slice.
+   */
+  const oversubscribed = reserved > inUse;
+  const scale = oversubscribed && reserved > 0 ? inUse / reserved : 1;
+
+  const segments: MemorySegment[] = attributed.map((entry) => ({
+    key: `serving:${entry.recipeId}`,
+    label: shortName(entry.name),
+    bytes: (entry.reservedBytes ?? 0) * scale,
+    color: recipeColor(recipes, entry.recipeId),
+  }));
+
+  segments.push({
+    key: 'in-use',
+    /* "Other" only once something else has been named. */
+    label: attributed.length > 0 ? 'Other' : plan ? 'Already in use' : 'In use',
+    bytes: Math.max(0, inUse - reserved * scale),
+    /* Neutral, not a hue: this is the memory no recipe accounts for, and a
+     * categorical slot here would mean the same fill twice over once a third
+     * recipe is up and takes that hue for itself. */
+    color: 'var(--ink-muted)',
+  });
 
   if (plan) {
+    /* The prospective run wears its own recipe's colour, so a model that is
+     * already up and the cost of running it again read as the same thing. When
+     * it IS already up, the new segment is hatched - two solid blocks of one
+     * hue separated by a 2px gap would read as a single slice, and this is
+     * exactly what the hatch is for: same entity, different state. */
+    const color = recipeColor(recipes, selectedId);
+    const alreadyUp = attributed.some((entry) => entry.recipeId === selectedId);
     segments.push({
       key: 'run',
-      label: 'This run needs',
+      label: alreadyUp ? 'Running it again' : 'This run needs',
       bytes: needs,
-      color: 'var(--series-power)',
+      color,
+      hatched: alreadyUp,
     });
     if (spare > 0) {
       segments.push({
         key: 'spare',
         label: 'Spare KV cache',
         bytes: spare,
-        color: 'var(--series-power)',
+        color,
         hatched: true,
       });
     }
@@ -295,9 +377,11 @@ function MachineMemory({
         footnote={
           over > 0
             ? `${bytes(over)} more than this machine has — shorten the context, lower the request count, or free some memory.`
-            : plan
-              ? undefined
-              : 'Select a recipe below to see how it would fit.'
+            : oversubscribed
+              ? `The servers above reserved ${bytes(reserved)} between them, more than the ${bytes(inUse)} the machine reports in use — vLLM claims its fraction up front and need not touch all of it. Shown to scale.`
+              : plan
+                ? undefined
+                : 'Select a recipe below to see how it would fit.'
         }
       />
     </div>
@@ -312,11 +396,15 @@ function MachineMemory({
 function RecipeCard({
   recipe,
   plan,
+  color,
   selected,
   onSelect,
 }: {
   recipe: Recipe;
   plan: RecipePlan;
+  /* This recipe's slot in the categorical palette - the same fill it takes on
+   * the memory bar, so picking a card and reading the bar are one motion. */
+  color: string;
   selected: boolean;
   onSelect: () => void;
 }) {
@@ -326,8 +414,13 @@ function RecipeCard({
     <button
       onClick={onSelect}
       aria-pressed={selected}
+      /* Selection is bordered in the recipe's own colour rather than one shared
+       * accent, so which card is chosen and which slice moved on the bar are
+       * the same fact. Never colour alone: aria-pressed carries it for a
+       * screen reader and the surface lifts as well. */
+      style={selected ? { borderColor: color } : undefined}
       className={`flex cursor-pointer flex-col gap-2 rounded-xl border p-3 text-left transition-colors ${
-        selected ? 'border-[color:var(--series-power)] bg-surface-2' : 'border-hairline hover:bg-surface-2'
+        selected ? 'bg-surface-2' : 'border-hairline hover:bg-surface-2'
       }`}
     >
       <span className="flex items-start gap-2">
@@ -337,6 +430,11 @@ function RecipeCard({
             label={plan.fits ? 'Fits on this node' : 'Will not run here'}
           />
         </span>
+        <span
+          aria-hidden
+          className="mt-1 h-2.5 w-2.5 shrink-0 rounded-[3px]"
+          style={{ background: color }}
+        />
         <span className="min-w-0 flex-1 text-[13px] font-medium text-ink">{recipe.name}</span>
       </span>
 
@@ -773,11 +871,14 @@ const STATUS_TONE = {
 function RunProgress({
   node,
   run,
+  color,
   busy,
   act,
 }: {
   node: NodeSnapshot;
   run: Run;
+  /* This recipe's slice colour on the bar above. */
+  color: string;
   busy: string | null;
   act: (key: string, action: () => Promise<string>) => Promise<void>;
 }) {
@@ -802,7 +903,16 @@ function RunProgress({
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
+            {/* Two marks, two facts: the dot is the run's state, the chip is
+                which recipe it is - the same fill it has on the bar above. It
+                greys out with the container, so a card whose slice is gone from
+                the bar does not still advertise a colour there. */}
             <StatusDot status={tone} />
+            <span
+              aria-hidden
+              className="h-2.5 w-2.5 shrink-0 rounded-[3px]"
+              style={{ background: serving || live ? color : 'var(--surface-2)' }}
+            />
             <span className="truncate text-[13px] font-medium text-ink">{run.recipeName}</span>
             <Badge>{stopped ? 'stopped' : run.status}</Badge>
           </div>
@@ -931,6 +1041,123 @@ function RunProgress({
               someone else is looking at it, and a bearer token that grants the
               endpoint is not something to leave sitting in plain view. */}
           {run.apiKey && <SecretField label="Bearer token" value={run.apiKey} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/*
+ * A recipe's colour: its position in the catalogue, in fixed order.
+ *
+ * Position rather than rank, so a colour follows the recipe and does not
+ * repaint when another one starts or stops. Six slots are defined; a seventh
+ * recipe would fold into the neutral remainder rather than invent a hue, which
+ * is why this returns the neutral past the end.
+ */
+const RECIPE_COLORS = [
+  'var(--recipe-1)',
+  'var(--recipe-2)',
+  'var(--recipe-3)',
+  'var(--recipe-4)',
+  'var(--recipe-5)',
+  'var(--recipe-6)',
+];
+
+/* The neutral a recipe falls back to: past the end of the palette, or for an id
+ * the catalogue does not have. Deliberately the same grey as the unattributed
+ * remainder and NOT a categorical slot - a wrapped hue would silently paint two
+ * different recipes the same colour, which is the one thing this must not do. */
+const RECIPE_COLOR_FALLBACK = 'var(--ink-muted)';
+
+function recipeColor(recipes: Recipe[], recipeId: string | null): string {
+  if (!recipeId) return RECIPE_COLOR_FALLBACK;
+  const index = recipes.findIndex((recipe) => recipe.id === recipeId);
+  return index === -1 ? RECIPE_COLOR_FALLBACK : (RECIPE_COLORS[index] ?? RECIPE_COLOR_FALLBACK);
+}
+
+/* Legend labels sit in a row that has to stay one line; a recipe's name carries
+ * its quantisation and drafter after a middle dot, which the bar does not need. */
+const shortName = (name: string) => name.split('\u00b7')[0]?.trim() ?? name;
+
+/*
+ * A recipe that is serving without a run behind it.
+ *
+ * Deliberately quieter than a run card: there is no phase trail to show,
+ * because the sequence that produced this container is not recorded any more -
+ * only that it is a recipe of ours and that it is up. It can still be stopped,
+ * through the container action rather than the run one, since there is no run
+ * id to stop.
+ */
+function ServingContainer({
+  node,
+  serving,
+  color,
+  sharedApiKey,
+  busy,
+  act,
+}: {
+  node: NodeSnapshot;
+  serving: ServingRecipe;
+  color: string;
+  sharedApiKey: boolean;
+  busy: string | null;
+  act: (key: string, action: () => Promise<string>) => Promise<void>;
+}) {
+  return (
+    <div className="mb-5 rounded-lg border border-hairline p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            {/* The same fill this recipe has on the bar above, so the slice and
+                the card are recognisably one thing without a lookup. */}
+            <span
+              aria-hidden
+              className="h-2.5 w-2.5 shrink-0 rounded-[3px]"
+              style={{ background: color }}
+            />
+            <span className="truncate text-[13px] font-medium text-ink">{serving.name}</span>
+            <Badge>serving</Badge>
+          </div>
+          <p className="mt-0.5 truncate text-[11px] text-ink-muted">
+            {serving.modelRepoId ?? serving.containerName} · {serving.status.toLowerCase()}
+          </p>
+        </div>
+
+        <div className="flex shrink-0 gap-1.5">
+          <Button
+            variant="danger"
+            disabled={busy !== null}
+            onClick={() =>
+              act(`stop:${serving.containerId}`, async () => {
+                await api.container(node.nodeId, serving.containerId, 'stop');
+                return `Stopped ${serving.containerName}.`;
+              })
+            }
+          >
+            Stop server
+          </Button>
+        </div>
+      </div>
+
+      {serving.port !== null && (
+        <div className="mt-3 space-y-2 rounded-lg bg-surface-2 px-3 py-2 text-[11px] text-ink-secondary">
+          <div>
+            Serving on{' '}
+            <code className="text-ink">
+              http://{node.host?.hostname ?? node.name}:{serving.port}
+              {serving.runtime === 'vllm' ? '/v1' : ''}
+            </code>
+          </div>
+          {/* No run record means no minted key to show. Which of the two it is
+              matters: one is recoverable from the vault, the other is not. */}
+          <p className="text-ink-muted">
+            {serving.runtime !== 'vllm'
+              ? 'No authentication in front of it.'
+              : sharedApiKey
+                ? 'Behind the vault\u2019s VLLM_API_KEY \u2014 this node has no run record for it.'
+                : 'This node has no run record for it, so the key it was started with is not shown here.'}
+          </p>
         </div>
       )}
     </div>

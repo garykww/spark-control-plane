@@ -36,6 +36,25 @@
   --series-temp: #eda100;
   --series-llm: #e87ba4;
   --series-power: #4a3aa7;
+  /*
+   * Recipe identity, a categorical dimension of its own: which model owns which
+   * slice of the memory bar. Slots 1,2,3,4,5,7 of the same validated order the
+   * series colours are drawn from - green and red are skipped deliberately,
+   * because they read as the status palette. Assigned by catalogue position and
+   * never cycled; past the sixth a recipe folds into the unattributed remainder.
+   *
+   * Validated for stacked (adjacent-pair) use on --surface-2 in both modes:
+   * worst adjacent CVD dE 9.1 light / 8.4 dark, normal-vision 19.6 / 19.3. Four
+   * of the light steps sit under 3:1 on that surface, so the relief rule
+   * applies - MemoryBar always ships a labelled legend carrying the value in
+   * ink, so identity never rests on the fill alone.
+   */
+  --recipe-1: #2a78d6;
+  --recipe-2: #eb6834;
+  --recipe-3: #1baf7a;
+  --recipe-4: #eda100;
+  --recipe-5: #e87ba4;
+  --recipe-6: #4a3aa7;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -62,6 +81,13 @@
     --series-temp: #c98500;
     --series-llm: #d55181;
     --series-power: #9085e9;
+    /* The same six hues stepped for a dark surface, not an automatic flip. */
+    --recipe-1: #3987e5;
+    --recipe-2: #d95926;
+    --recipe-3: #199e70;
+    --recipe-4: #c98500;
+    --recipe-5: #d55181;
+    --recipe-6: #9085e9;
   }
 }
 
@@ -88,6 +114,13 @@
   --series-temp: #c98500;
   --series-llm: #d55181;
   --series-power: #9085e9;
+  /* The same six hues stepped for a dark surface, not an automatic flip. */
+  --recipe-1: #3987e5;
+  --recipe-2: #d95926;
+  --recipe-3: #199e70;
+  --recipe-4: #c98500;
+  --recipe-5: #d55181;
+  --recipe-6: #9085e9;
 }
 
 /* Pure black for OLED panels - inherits every other token from dark. */
@@ -114,6 +147,13 @@
   --series-temp: #c98500;
   --series-llm: #d55181;
   --series-power: #9085e9;
+  /* The same six hues stepped for a dark surface, not an automatic flip. */
+  --recipe-1: #3987e5;
+  --recipe-2: #d95926;
+  --recipe-3: #199e70;
+  --recipe-4: #c98500;
+  --recipe-5: #d55181;
+  --recipe-6: #9085e9;
 }
 
 /* Expose the tokens to Tailwind so bg-surface-1, text-muted, etc. exist. */
