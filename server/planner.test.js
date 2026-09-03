@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   assertRunId,
   buildRunScript,
@@ -9,6 +12,7 @@ import {
   cancelRun,
   stopRun,
   clearRun,
+  SWEEP_FINISHED_RUNS,
 } from './planner.js';
 import { RECIPES, recipeById, parseRecipes } from './recipes.js';
 
@@ -427,4 +431,62 @@ test('a declared command replaces the image CMD, and a recipe without one adds n
   const vllm = recipeById(KEPT);
   assert.deepEqual(vllm.command, []);
   assert.equal(scriptFor(KEPT).includes("' --listen '"), false);
+});
+
+/*
+ * The sweep, run for real against a fake node.
+ *
+ * Reading the string would only prove it says what it says; the thing worth
+ * knowing is what it DELETES, and that depends on `find -mmin`, a glob and a
+ * `grep -qxF` all agreeing. So this builds a runs directory, puts a stub
+ * `docker` on PATH, points HOME at it, and checks what survives.
+ */
+test('the sweep discards spent runs and spares one that is still serving', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep-test-'));
+  const runs = path.join(home, '.cache/spark-control-plane/runs');
+  const bin = path.join(home, 'bin');
+  fs.mkdirSync(runs, { recursive: true });
+  fs.mkdirSync(bin, { recursive: true });
+
+  /* Only this one is up. `docker ps --format` prints one name per line. */
+  fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\nprintf "%s\\n" still-serving other-thing\n');
+  fs.chmodSync(path.join(bin, 'docker'), 0o755);
+
+  const A_DAY_AGO = new Date(Date.now() - 48 * 3600 * 1000);
+  const make = (name, container, { finished = true, old = true } = {}) => {
+    const dir = path.join(runs, name);
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'container'), container);
+    if (finished) fs.writeFileSync(path.join(dir, 'exit'), '0\n');
+    if (old) fs.utimesSync(dir, A_DAY_AGO, A_DAY_AGO);
+  };
+
+  make('run-1788000000001-aaaaaaaa', 'still-serving');
+  make('run-1788000000002-bbbbbbbb', 'gone');
+  make('run-1788000000003-cccccccc', 'gone-too', { old: false });
+  make('run-1788000000004-dddddddd', 'in-flight', { finished: false });
+
+  execFileSync('sh', ['-c', SWEEP_FINISHED_RUNS], {
+    env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` },
+  });
+
+  const left = fs.readdirSync(runs).sort();
+  assert.deepEqual(left, [
+    /* Finished and a day old, but its container is still up: the only record of
+     * where that model is serving and of the key it minted. */
+    'run-1788000000001-aaaaaaaa',
+    /* Spent, but not yet a day old. */
+    'run-1788000000003-cccccccc',
+    /* No exit file - still working. */
+    'run-1788000000004-dddddddd',
+  ]);
+
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('the sweep is valid shell and is what a launch actually runs', () => {
+  assert.doesNotThrow(() => execFileSync('sh', ['-n'], { input: SWEEP_FINISHED_RUNS }));
+  /* Guards the join in startRun's command: a missing separator would swallow
+   * the `echo launched` the launch route checks for. */
+  assert.ok(SWEEP_FINISHED_RUNS.trimEnd().endsWith(';'), SWEEP_FINISHED_RUNS);
 });
