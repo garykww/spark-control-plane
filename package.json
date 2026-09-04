@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Web control panel for NVIDIA DGX Spark (GB10) and other Linux GPU hosts",
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   },

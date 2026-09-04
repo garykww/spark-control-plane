@@ -397,3 +397,7 @@ src/
 ## Credit
 
 Inspired by [sparkDash](https://github.com/MiaAI-Lab/sparkDash), which covers similar ground for the same hardware.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
