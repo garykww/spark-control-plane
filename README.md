@@ -25,26 +25,84 @@ Metrics stream over a WebSocket. History is kept on the server, so a browser ref
 
 ## Requirements
 
-- Node.js 20 or newer (or Docker)
+- Node.js 20 or newer (or Docker) — the installer below fetches its own copy if you don't have one
 - SSH access to each machine you want to monitor
 - `nvidia-smi` on those machines — everything else comes from `/proc` and `/sys`
 
 You don't need to install an agent on the monitored machines. The server runs ordinary read-only commands over SSH.
 
+## Install
+
+One command, on the machine you want the dashboard to run on:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/garykww/spark-control-plane/main/install.sh)"
+```
+
+It clones the repo into `~/.spark-control-plane`, installs the dependencies, builds the UI, and puts a `spark-control-plane` command on your PATH. Nothing needs sudo: if `/usr/local/bin` isn't writable the command goes to `~/.local/bin`, and if Node 20+ isn't already there it downloads a private copy into the prefix rather than touching the system.
+
+Then start it:
+
+```bash
+spark-control-plane                # http://127.0.0.1:5555
+DEMO_MODE=1 spark-control-plane    # synthetic nodes, no hardware needed
+```
+
+Say yes to the service prompt — or pass `--service` — to have it start on boot under systemd (Linux) or launchd (macOS).
+
+Options are flags or environment variables, whichever suits:
+
+| Flag | Variable | Default |
+|---|---|---|
+| `--prefix DIR` | `SPARK_PREFIX` | `~/.spark-control-plane` |
+| `--branch NAME` | `SPARK_BRANCH` | `main` |
+| `--port N` | `SPARK_PORT` | `5555` |
+| `--bind HOST` | `SPARK_BIND_HOST` | `127.0.0.1` |
+| `--service`, `--no-service` | `SPARK_SERVICE` | ask |
+| `--yes` | `NONINTERACTIVE` | ask |
+
+Through `bash -c` the variables are the easier form:
+
+```bash
+SPARK_SERVICE=1 SPARK_PORT=8080 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/garykww/spark-control-plane/main/install.sh)"
+```
+
+Flags work too, but need an empty argument first, because `bash -c` hands the next word to `$0`:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/garykww/spark-control-plane/main/install.sh)" "" --service --port 8080
+```
+
+Port and bind address live in `~/.spark-control-plane/spark-control-plane.env`, which updates never overwrite. Re-run the installer to update — it fast-forwards the checkout, rebuilds, and leaves your config and any local edits alone. To remove it:
+
+```bash
+bash ~/.spark-control-plane/install.sh --uninstall
+```
+
+That stops the service and removes the launcher, then asks before deleting the prefix — `config/` in there holds your node list and encrypted SSH secrets.
+
 ## Try it without any hardware
 
-Demo mode serves synthetic metrics for three fake nodes, which is enough to see the whole UI:
+Demo mode serves synthetic metrics for three fake nodes, which is enough to see the whole UI. If you installed with the one-liner above:
+
+```bash
+DEMO_MODE=1 spark-control-plane      # http://127.0.0.1:5555
+```
+
+From a checkout, with the Vite dev server in front:
 
 ```bash
 npm install
-DEMO_MODE=1 npm run dev
+DEMO_MODE=1 npm run dev              # http://localhost:5173
 ```
 
-Open <http://localhost:5173>. You should see three nodes with moving charts and a `DEMO DATA` badge in the header.
+Either way you should see three nodes with moving charts and a `DEMO DATA` badge in the header.
 
 Every screenshot in this README comes from demo mode, which is why the nodes are named `spark-demo-01` and friends.
 
-## Run it for real
+## Run it from a checkout
+
+If you'd rather skip the installer, or you're working on the code:
 
 ```bash
 npm install
@@ -65,6 +123,8 @@ By default the server binds to loopback, so only the machine running it can conn
 ```bash
 BIND_HOST=0.0.0.0 npm start
 ```
+
+An installed copy takes it from its own env file instead: set `BIND_HOST=0.0.0.0` in `~/.spark-control-plane/spark-control-plane.env`, then restart it — `systemctl --user restart spark-control-plane` if it runs as a service, or just start it again if it doesn't.
 
 > **Warning**: the API has no authentication. It assumes a trusted network, exactly like the SSH keys it uses. Don't expose it to the internet — put it behind Tailscale, a VPN, or an authenticating reverse proxy.
 
@@ -96,7 +156,9 @@ Every setting is an environment variable, and every one is optional. `.env.examp
 | `RECIPES_FILE` | `./recipes.yaml` | The run planner's recipe catalogue |
 | `DEMO_MODE` | off | Serve synthetic metrics |
 
-Runtime state lives in `config/`: `nodes.json` holds the node list, `nodes-secrets.json` holds SSH passwords encrypted with AES-256-GCM, `vault.json` holds the control plane's own secrets under the same encryption, and `.secret-key` holds the generated key when you haven't set `SECRET_KEY`. All four are gitignored.
+Nothing reads a `.env` file on its own. `npm start` inherits whatever is already in your shell, and the installed `spark-control-plane` command sources `~/.spark-control-plane/spark-control-plane.env` before starting the server — that is the file to edit for an installed copy, and updates never overwrite it.
+
+Runtime state lives in `config/` beside the server, so `~/.spark-control-plane/config/` for an installed copy: `nodes.json` holds the node list, `nodes-secrets.json` holds SSH passwords encrypted with AES-256-GCM, `vault.json` holds the control plane's own secrets under the same encryption, and `.secret-key` holds the generated key when you haven't set `SECRET_KEY`. All four are gitignored.
 
 Set `SECRET_KEY` yourself if you rebuild containers without persisting `config/`. Without it, a new key is generated and previously stored passwords and vault secrets can't be decrypted — you'd have to re-enter them.
 
@@ -363,6 +425,7 @@ The tests cover the parsing and validation logic — `/proc` and `nvidia-smi` ou
 ### Layout
 
 ```
+install.sh          the one-command installer
 recipes.yaml        the run planner's recipe catalogue
 server/
   index.js          HTTP + WebSocket entry point
