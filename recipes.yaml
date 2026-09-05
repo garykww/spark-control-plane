@@ -11,8 +11,8 @@
 # serve-qwen36-35b-a3b-dflash.sh, serve-diffusiongemma-26b-a4b.sh and
 # run-comfyui-h3-spark.sh. Each carries the reasoning from the script it came
 # from, and says which of that script's knobs the planner now decides instead.
-# The fifth, Qwen3-ASR, has no script behind it and derives its figures from the
-# model's own config and from vLLM's source.
+# The last two, Qwen3-ASR and GLM-ASR-Nano, have no script behind them and
+# derive their figures from each model's own config and from vLLM's source.
 #
 # Edit this file and restart the server. Every recipe is validated on load: a
 # bad one is reported by name and the whole catalogue is refused rather than
@@ -783,3 +783,248 @@
       Qwen/Qwen3-ASR-0.6B is the same architecture at a third the weights, and
       also has a realtime variant for the /v1/realtime WebSocket - that one is
       not auto-detected and needs its architecture forced with --hf-overrides.
+
+# ---------------------------------------------------------------------------
+# GLM-ASR-Nano-2512. The second speech recogniser, and the first recipe that
+# reuses another's image rather than building its own tag: the audio wheels it
+# needs are exactly the four the Qwen3-ASR recipe adds, so it names the same
+# `vllm-openai-audio:v0.28.0-aarch64` and the build is a docker layer-cache hit
+# whichever of the two runs first. Keep the build steps below byte-identical to
+# that recipe's or the cache misses and both tags get rebuilt in turn.
+#
+# WHAT THE UPSTREAM RECIPE SAYS TO DO, AND WHY MOST OF IT IS ALREADY DONE.
+# recipes.vllm.ai/zai-org/GLM-ASR-Nano-2512 builds a venv, installs transformers
+# from git and then `vllm[audio]` from PyPI. Against the pinned image none of
+# that applies. vLLM v0.28.0's requirements/common.txt pins `transformers >=
+# 5.5.3`, well past the 5.0.0 the model card asks for, so the image already
+# understands GlmAsrProcessor and installing transformers from source would only
+# swap a tested pin for a nightly. `GlmAsrForConditionalGeneration` is in
+# v0.28.0's model registry, mapped to the `glmasr` module. What the stock image
+# genuinely lacks is the same thing it lacked for Qwen3-ASR: the audio extra.
+#
+# BENCHMARKS, AND WHOSE THEY ARE. The model card leads with an average error
+# rate of 4.10, and the upstream recipe repeats it as "SOTA". That figure is
+# z.ai's own mix, weighted towards Chinese sets (Wenet Meeting, Aishell-1),
+# which is where this model is genuinely strong. The neutral number is in the
+# repo's own .eval_results: open-asr-leaderboard mean WER 7.03 at RTFx 145.28,
+# recorded 2025-12-09 - LibriSpeech clean 2.15, AMI 16.15. Both are real; they
+# measure different things, and only the second is comparable across models.
+#
+# KV CACHE. text_config in config.json: 28 layers, 4 kv heads, head_dim 128,
+# dtype bfloat16.
+#
+#   28 layers x 2 (K and V) x 4 kv heads x 128 head_dim x 2 bytes
+#     = 57,344 bytes per token
+#
+# Half Qwen3-ASR's rate, from half the kv heads, against a window an eighth the
+# size. A full-length 8,192-token sequence is 0.47 GB of pool, so on a Spark the
+# KV cache is not a constraint here at any concurrency the panel offers - which
+# is why --max-num-seqs starts higher than the other ASR recipe's.
+#
+# HOW MUCH CONTEXT IS A SECOND OF AUDIO: 12.5 tokens, and unlike Qwen3-ASR the
+# encoder is CHUNKED. vLLM cuts audio into 30-second windows
+# (WhisperFeatureExtractor chunk_length 30) and runs the tower over the batch.
+# Per window, from glmasr.py's conv params [(1,3,1), (1,3,2)] and merge_factor 4
+# in glmasr_utils.py, over 3,000 mel frames at 100 frames per second:
+#
+#   conv1 (pad 1, kernel 3, stride 1):  (3000 + 2 - 3) // 1 + 1  = 3000
+#   conv2 (pad 1, kernel 3, stride 2):  (3000 + 2 - 3) // 2 + 1  = 1500
+#   merge 4:                            (1500 - 4)     // 4 + 1  =  375
+#
+# 375 tokens per 30-second window, so 12.5 per second. A partial window is not
+# rounded up to a full one: the tower's output is trimmed by
+# feature_attention_mask.sum(-1), so a 5-second tail costs 62 tokens, not 375.
+#
+# THE TRAP, AND THE ONE FLAG THAT DEFUSES IT. processor_config.json sets
+# max_audio_len to 655, and vLLM reads that field as SECONDS in two places at
+# once. It becomes SpeechToTextConfig.max_audio_clip_s, the length at which
+# /v1/audio/transcriptions splits an upload, and it becomes max_windows =
+# 655 // 30 = 21, the most 30-second windows one prompt may carry. Every other
+# Whisper-shaped ASR model in vLLM chunks at the feature extractor's
+# chunk_length, which is 30 here and 30 for Qwen3-ASR; GLM-ASR is the anomaly,
+# because its handler prefers processor.max_audio_len when that field exists.
+#
+# 655 seconds is twenty-two times what this model can actually transcribe.
+# MEASURED on a Spark, 2026-09-05, same clip in every row:
+#
+#   audio in    prompt tokens   transcript out    what came back
+#     30 s          390            226 chars      the whole 30 seconds
+#    300 s        3,765             38 chars      one sentence, then EOS
+#    570 s          n/a         10,856 chars      one sentence looped 82x
+#
+# The model was trained on utterances that fit its 30-second window, so past
+# roughly that length it stops after the first sentence or falls into a
+# repetition loop. Nothing errors: every one of those was HTTP 200. The 570 s
+# row is the default path - upload a ten-minute recording to
+# /v1/audio/transcriptions and it returns 200 with a transcript that is 5.5%
+# unique text and covers almost none of the recording.
+#
+# The context arithmetic is a red herring, and the first version of this recipe
+# led with it. 630 seconds of audio is 7,875 tokens in an 8,192 window, which
+# does leave only ~317 tokens for the transcript - but the model never gets far
+# enough to need them. Fixing the chunk length fixes both at once.
+#
+# --mm-processor-kwargs '{"max_audio_len": 30}' moves both numbers together,
+# because both read the same processor attribute. 30 makes this model behave
+# like every other Whisper-shaped recogniser vLLM serves: the endpoint splits a
+# long upload at the quietest point near each 30-second boundary, sends each
+# piece as its own 375-token request, and stitches the results. It also shrinks
+# the dummy audio vLLM profiles with.
+#
+# MEASURED on a Spark, 2026-09-05, and worth repeating because the startup log
+# actively argues against it. transformers prints
+#
+#   [transformers] Keyword argument `max_audio_len` is not a valid argument
+#   for this processor and will be ignored.
+#
+# and that warning is WRONG in the way that matters: max_audio_len is not in
+# GlmAsrProcessor.__init__'s signature, so transformers complains, but the value
+# still lands on the processor and vLLM reads it off the object. A 402.8-second
+# recording sent to /v1/chat/completions came back with 3,757 prompt tokens -
+# 10 windows x 375, plus 7 for the prompt. Left at 655 the same file would have
+# been 14 windows and 5,257. Do not "fix" this flag because of the warning; test
+# it with a file longer than 300 seconds and read prompt_tokens instead.
+#
+# This lowers the longest single chat prompt from 630 seconds to 30, which is
+# the honest ceiling: the measurements above are what the longer prompts were
+# actually worth. Raising it buys nothing until a model ships that can hold a
+# transcript longer than its training window.
+#
+# The three decode caps are the same ones the Qwen3-ASR recipe raises, and they
+# still bite here: an upload is decoded WHOLE before it is split into 300-second
+# chunks, so a forty-minute recording meets the 600-second decode cap long
+# before the splitter ever sees it.
+
+- id: glm-asr-nano-2512
+  name: GLM-ASR-Nano-2512 · BF16
+  summary: >-
+    Mandarin, Cantonese and English speech recognition, strongest of the two
+    ASR recipes on Chinese and on quiet speech. 2.3B total, 1.5B active, behind
+    a chunked Whisper-style encoder - small weights and a short 8K window.
+  model:
+    # Measured: the Hub's file listing at revision 61ba4e0b, read 2026-09-05.
+    # 4,522,623,926 bytes, almost all of it the single model.safetensors.
+    repo: zai-org/GLM-ASR-Nano-2512
+    sizeGB: 4.5
+    measured: true
+  image:
+    # Shared with qwen3-asr-1-7b on purpose - same tag, same Dockerfile, so
+    # whichever recipe runs second builds nothing. See the header.
+    ref: vllm-openai-audio:v0.28.0-aarch64
+    build:
+      from: vllm/vllm-openai:v0.28.0-aarch64
+      run:
+        # Byte-identical to the Qwen3-ASR recipe's step. Do not "improve" one
+        # without the other; the layer cache is the whole point.
+        - uv pip install --system --no-cache av scipy soundfile soxr
+  container: spark-run-glm-asr-nano
+  port: 8000
+  # MEASURED, off a real startup on a Spark on 2026-09-05 at --max-num-seqs 8
+  # and --max-num-batched-tokens 8192. vLLM logged 6.21 GiB for weights plus
+  # non-torch against 4.21 GiB of weight files, so:
+  #
+  #   2.00 GiB  non-torch (the CUDA context)
+  #   0.80 GiB  peak activation
+  #   0.50 GiB  CUDAGraph memory
+  #   3.30 GiB  = 3.6 GB
+  #
+  # The first estimate here was 6 GB, scaled from the Qwen3-ASR recipe. It was
+  # 1.7x too high, mostly in the CUDA context: the batched audio tower turned
+  # out to cost far less than the guess allowed for. Erring high cost nothing -
+  # a pool too small for max-model-len makes the server exit during startup.
+  overheadGB: 3.6
+  # MEASURED, and exactly the architectural figure: 28 text layers x 2 x 4 kv
+  # heads x 128 head_dim x 2 bytes. vLLM logged a 119,360-token pool in 6.38
+  # GiB, and 119,360 x 57,344 is 6.375 GiB, which is what 6.38 rounds from.
+  # Dense attention on ordinary 16-token blocks, so no padding correction
+  # applies - the only waste is a partial final block per sequence.
+  kvBytesPerToken: 57344
+  kvMeasured: true
+  env:
+    # Raised together, because decoding stops at whichever is lowest. These are
+    # HOST allocations outside vLLM's fraction, so they come out of the free
+    # headroom the panel shows rather than anything the plan reserves.
+    VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: 256
+    VLLM_MAX_AUDIO_DECODE_DURATION_S: 3600
+    VLLM_MAX_AUDIO_DECODE_BYTES: 1073741824
+  args:
+    # Each request carries its own audio, so the only shared prefix is the
+    # ~20-token generation prompt. Costs nothing, buys almost nothing here.
+    --enable-prefix-caching: true
+    --enable-chunked-prefill: true
+    # config.json: text_config.max_position_embeddings 8192. The model's native
+    # window and the panel's ceiling. Short by modern standards, and the reason
+    # max_audio_len has to come down - see the header.
+    --max-model-len: 8192
+    # Higher than the Qwen3-ASR recipe's 8 because a full-length sequence here
+    # is 0.47 GB of KV against its 7.5 GB. Audio requests are short and this
+    # model is small, so streams are where throughput comes from; the panel
+    # offers up to 64 and that is the direction to go.
+    --max-num-seqs: 16
+    # One full-length request per batch. The overhead figure above is scaled
+    # from a measurement at this value, and peak activation is what tracks it.
+    --max-num-batched-tokens: 8192
+    # auto means "the model's dtype", which is bfloat16 here. DO NOT write
+    # bfloat16: vLLM only accepts that value for models that default to fp8 KV.
+    # fp8 would halve the rate but needs --calculate-kv-scales, since this
+    # export ships no scaling factors - and KV is not the constraint here.
+    --kv-cache-dtype: auto
+    # The header explains this one at length, with the measurements. It is the
+    # difference between a transcript of the recording and one sentence of it.
+    --mm-processor-kwargs: '{"max_audio_len": 30}'
+  notes:
+    - >-
+      A transcription server. Point an OpenAI client at
+      /v1/audio/transcriptions; /v1/audio/translations and
+      /v1/chat/completions with input_audio work too, and chat is the only way
+      to send a whole recording as a single prompt.
+    - >-
+      Strongest of the two ASR recipes on Mandarin, Cantonese and other Chinese
+      dialects, and trained specifically for quiet and whispered speech. On the
+      neutral open-asr-leaderboard it scores 7.03 mean WER at RTFx 145.28; the
+      4.10 the model card advertises is z.ai's own Chinese-weighted mix.
+    - >-
+      Audio costs 12.5 tokens per second, in 30-second windows of 375 tokens
+      each, so one chunk is a ~390-token request and the 8,192 window is never
+      the binding constraint through the transcription endpoint.
+    - >-
+      This recipe caps audio at 30 seconds with --mm-processor-kwargs, which is
+      the model's training window and what every other Whisper-shaped model in
+      vLLM uses. At vLLM's default of 655 a ten-minute upload returns HTTP 200
+      with one sentence looped 82 times; at 30 the same recording transcribes
+      in full. Long recordings still go in whole - the endpoint splits them and
+      stitches the pieces back together.
+    - >-
+      It shares its built image with the Qwen3-ASR recipe, so only the first of
+      the two to run pays for the build. The stock vllm/vllm-openai ships
+      without vLLM's audio extra and its loaders degrade to placeholders rather
+      than failing at import, so it would start, pass the readiness probe, and
+      fail on the first audio file.
+    - >-
+      Three decode caps limit input length, and at vLLM's defaults the one that
+      bites is 10 minutes of decoded audio, not the 25 MB upload size. An
+      upload is decoded whole before it is split, so this matters for long
+      recordings even though each chunk is 5 minutes. All three are raised.
+    - >-
+      Every figure here is measured on a Spark: weights from the Hub listing,
+      and the KV rate and overhead off a real vLLM 0.28.0 startup on
+      2026-09-05. It served an 11-second clip in 1.1 seconds.
+    - >-
+      The startup log says max_audio_len "is not a valid argument for this
+      processor and will be ignored". It is not ignored - transformers only
+      means it is not a named __init__ argument. Check it by sending a clip
+      longer than the cap and reading prompt_tokens: it stops rising at 390.
+    - >-
+      The audio encoder gets its own cache budget, equal to
+      --max-num-batched-tokens. At 8,192 and 30-second chunks that is 21 clips
+      encoding at once, comfortably more than --max-num-seqs, so concurrency is
+      free to rise.
+    - >-
+      vLLM sends its own transcription prompt, not the "Please transcribe this
+      audio into text" the processor ships as default_transcription_prompt. It
+      works at 30-second chunks. Use /v1/chat/completions with the model's own
+      prompt if you ever need to match the model card exactly.
+    - >-
+      Unlike the pinned vLLM the upstream recipe assumes, no transformers
+      install is needed: v0.28.0 already pins transformers >= 5.5.3 and knows
+      GlmAsrForConditionalGeneration.
