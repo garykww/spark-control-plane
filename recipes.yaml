@@ -647,6 +647,159 @@
       running container is reading.
 
 # ---------------------------------------------------------------------------
+# AN EXPERIMENT, and the only reason it is a separate recipe rather than flags
+# on the one above: it changes how attention is computed, and the working
+# ComfyUI should stay reachable while this is being proved. Different tag,
+# different container, different port, same weights and same volumes.
+#
+# WHAT IT ADDS. Video Sparse Attention - FastVideo's trainable 90%-sparse
+# attention for video diffusion - routed into H3's DiT by a third-party node,
+# plus FastVideo's 4-step distillation adapter. Draft video in a fraction of
+# the denoise cost.
+#
+# WHOSE CODE THIS IS. Not FastVideo's own ComfyUI integration: that one
+# (hao-ai-lab/FastVideo, comfyui/) carries FastHunyuan and Wan2.1-I2V and has
+# no H3 support at all. The node here is barelymining/ComfyUI-MiniMax-H3-
+# FastVideo, which is unaffiliated and, at the time of writing, tested by its
+# author on exactly one machine: an RTX 3090 Ti on Windows under SwarmUI.
+# Pinned to nothing - the clone below takes whatever main is.
+#
+# WHY IT SHOULD RUN ON A GB10 ANYWAY. VSA ships two implementations, and its
+# README is explicit: H100 via ThunderKittens, "any other GPU via triton".
+# vsa/setup.py builds the vsa_cuda extension with -arch=sm_90a, and
+# block_sparse_wrapper.py guards it with a plain
+#
+#   try: from vsa_cuda import block_sparse_fwd, block_sparse_bwd
+#   except ImportError: block_sparse_fwd = None
+#
+# then gates the fast path on `if major == 9 and minor == 0`. A GB10 reports
+# capability (12, 1), so it takes the Triton path, which JIT-compiles for
+# whatever is present. The author's own 3090 Ti is sm_86 and takes that same
+# path, so it is at least exercised off Hopper.
+#
+# This is also why the build below COPIES the vsa package instead of pip
+# installing it. vsa is sdist-only on PyPI, so pip would try to compile that
+# sm_90a extension - on aarch64, against a GB10. Copying the pure-Python tree
+# skips the build entirely and lets the ImportError fallback do its job.
+#
+# WHAT YOU DO NOT GET. The headline FastVideo numbers - 14x, the tile-64 CUDA
+# kernel - are the ThunderKittens path. This is the portable one. Expect a
+# real speedup, not that one. And VSA is a SPEED optimisation, not a memory
+# one: it will not make anything fit that does not already fit, which is why
+# memoryGB below is unchanged and still the other recipe's measurement.
+#
+# TASK COVERAGE, which is a mess worth stating plainly. The node supports
+# FL2VA only; its README says T2VA, Ref2VA and L2VA "would need matching
+# FastVideo LoRAs (not yet released)". FastVideo's own FastH3 Preview v1 is
+# the other way round - text-to-video-and-audio only, FL2VA and Ref2VA not
+# distilled - and vLLM's H3 blog post contradicts itself by passing
+# --task-type fl2va in a FastH3 command whose own constraints say T2VA only.
+# The adapters differ between all three. FL2VA is what this recipe targets,
+# and FL2VA is the tier already cached, which is the one lucky part.
+#
+# TWO FILES THIS RECIPE CANNOT FETCH. The node wants
+# fasth3_vsa_4-steps-v5.safetensors (2.05 GB) and fasth3_vsa_gate.safetensors
+# (3.6 GB) in models/loras. They are converted artifacts rather than files in
+# a HuggingFace repo, so `weights` cannot express them - put them in
+# ~/Workspace/comfyui/models/loras on the node, which the mount below picks
+# up. WITHOUT THEM THE NODE LOADS AND THE SAMPLER HAS NOTHING TO USE.
+
+- id: comfyui-minimax-h3-vsa
+  runtime: service
+  name: ComfyUI · MiniMax H3 + VSA (experiment)
+  summary: >-
+    The H3 stack with FastVideo's Video Sparse Attention routed into the DiT,
+    for 4-step draft video. Unproven on GB10 - it falls back to VSA's Triton
+    kernel rather than the Hopper one. FL2VA only.
+  image:
+    # Derived from the recipe above's image, which must exist first.
+    ref: comfyui-minimax-h3-vsa:local
+    build:
+      from: comfyui-minimax-h3:local
+      run:
+        # The node imports pytest at load time.
+        - pip install --no-cache-dir pytest
+        # vsa 0.0.3, pinned by URL. Copied, not pip installed - see the header.
+        - curl -sSL https://files.pythonhosted.org/packages/8b/4a/fb5ff06de1cd108e4ff0a44e9dfe6aa7fda782d1e86a6bea052e731eed86/vsa-0.0.3.tar.gz -o /tmp/vsa.tar.gz
+        - tar xzf /tmp/vsa.tar.gz -C /tmp
+        - cp -r /tmp/vsa-0.0.3/vsa /usr/local/lib/python3.12/dist-packages/vsa
+        - rm -rf /tmp/vsa.tar.gz /tmp/vsa-0.0.3
+        # Unpinned on purpose: this is an experiment and the node is moving.
+        # Pin a commit here the moment a run has to be repeatable.
+        - git clone --depth 1 https://github.com/barelymining/ComfyUI-MiniMax-H3-FastVideo /workspace/ComfyUI/custom_nodes/ComfyUI-MiniMax-H3-FastVideo
+  container: comfyui-h3-vsa
+  port: 8189
+  containerPort: 8188
+  ipcHost: true
+  # NOT measured here - carried over from the recipe above, because VSA changes
+  # the cost of attention and not what is resident. Treat it as a ceiling that
+  # has not been re-checked rather than a figure from this configuration.
+  memoryGB: 100
+  memoryMeasured: false
+  command:
+    - --listen
+    - 0.0.0.0
+    - --port
+    - "8188"
+  readiness:
+    path: /system_stats
+    auth: none
+  volumes:
+    - host: ~/Workspace/comfyui/input
+      container: /workspace/ComfyUI/input
+    - host: ~/Workspace/comfyui/output
+      container: /workspace/ComfyUI/output
+    - host: ~/Workspace/comfyui/workflows
+      container: /workspace/ComfyUI/user/default/workflows
+    # Carries the two FastVideo adapters as well as ordinary LoRAs.
+    - host: ~/Workspace/comfyui/models/loras
+      container: /workspace/ComfyUI/models/loras
+  weights:
+    # Identical to the recipe above - same cache entries, same mount points, so
+    # running this costs no extra download. See there for what the tiers trade.
+    - repo: Comfy-Org/MiniMax-H3
+      sizeGB: 124.6
+      measured: true
+      mountBase: /workspace/ComfyUI/models
+      files:
+        - diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors
+        - text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
+        - vae/minimax_h3_video_vae_fp16.safetensors
+        - vae/minimax_h3_audio_vae_fp32.safetensors
+        - diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+        - diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
+        - text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+  notes:
+    - >-
+      An experiment on port 8189, beside the ordinary ComfyUI on 8188, so both
+      can run and be compared. It builds its own image from that one's, which
+      therefore has to exist before this will start.
+    - >-
+      Adds one node, "MiniMax H3 VSA" under H3 Acceleration. Put it between the
+      model and the sampler; topk_ratio is the sparsity knob and small-detail
+      flicker at low values is inherent to sparse attention.
+    - >-
+      FL2VA only. The node has no adapter for T2VA, Ref2VA or L2VA, so the
+      ref2va weights mounted here are for the other recipe, not this one.
+    - >-
+      Needs two files this recipe cannot fetch - fasth3_vsa_4-steps-v5 and
+      fasth3_vsa_gate - dropped into ~/Workspace/comfyui/models/loras on the
+      node. They are converted artifacts, not HuggingFace repo files.
+    - >-
+      On a GB10 this runs VSA's Triton kernel, not the ThunderKittens one that
+      FastVideo's published speedups come from, because the CUDA extension is
+      built -arch=sm_90a and a GB10 reports (12, 1). Expect a speedup, not the
+      advertised one.
+    - >-
+      VSA saves time, not memory. It will not make a resolution or duration fit
+      that does not already fit, and memoryGB here is unverified - it is the
+      other recipe's measurement carried across.
+    - >-
+      Third-party and unpinned: the node is not FastVideo's own ComfyUI
+      integration, which has no H3 support, and its author has tested it on one
+      non-GB10 machine. Pin the clone before trusting a result.
+
+# ---------------------------------------------------------------------------
 # NOT a port of a launcher script - this one is new, from
 # https://github.com/QwenLM/Qwen3-ASR (Apache-2.0, weights included).
 #
