@@ -22,7 +22,7 @@ const BACKEND_BY_METRIC_PREFIX = [
 
 async function getJson(url, timeoutMs) {
   const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
   return res.json();
 }
 
@@ -122,6 +122,17 @@ function backendFromMetrics(metrics) {
 }
 
 /*
+ * Ports that answered /v1/models with 401 at least once. vLLM's --api-key
+ * doesn't rotate mid-run, so once a port has told us it's gated there is
+ * nothing a retry would learn - it would just be another rejected request
+ * added to that server's log, forever, every poll. Cleared only by the
+ * process restarting, which is also the only way the port's answer could
+ * ever change (a new container on the same port is a new poll cycle either
+ * way, since the dashboard doesn't restart mid-run).
+ */
+const unauthorizedPorts = new Set();
+
+/*
  * Returns a probe result for one endpoint. Never throws: an unreachable port is
  * a normal steady state (the model server simply is not running yet), so it is
  * reported as offline with the reason attached.
@@ -131,9 +142,10 @@ export async function probeLlmEndpoint(endpoint) {
   const base = `http://${host}:${port}`;
   const timeout = config.httpProbeTimeoutMs;
   const startedAt = Date.now();
+  const id = `${host}:${port}`;
 
   const result = {
-    id: `${host}:${port}`,
+    id,
     label: label || `${port}`,
     port,
     online: false,
@@ -145,19 +157,32 @@ export async function probeLlmEndpoint(endpoint) {
   };
 
   /* Identify the server and its loaded models. */
-  try {
-    const data = await getJson(`${base}/v1/models`, timeout);
-    result.online = true;
-    result.backend = 'OpenAI-compatible';
-    result.models = (data?.data ?? []).map((m) => m.id).filter(Boolean);
-  } catch (err) {
+  if (unauthorizedPorts.has(id)) {
+    result.error = 'HTTP 401 (not retried - key required)';
+  } else {
     try {
-      const data = await getJson(`${base}/api/tags`, timeout);
+      const data = await getJson(`${base}/v1/models`, timeout);
       result.online = true;
-      result.backend = 'Ollama';
-      result.models = (data?.models ?? []).map((m) => m.name).filter(Boolean);
-    } catch {
+      result.backend = 'OpenAI-compatible';
+      result.models = (data?.data ?? []).map((m) => m.id).filter(Boolean);
+    } catch (err) {
       result.error = String(err?.message || err);
+      if (err?.status === 401) {
+        unauthorizedPorts.add(id);
+      } else if (err?.status !== 404) {
+        /* A real 404 means this path doesn't exist here, but the fetch
+         * failing outright (offline, timed out, 5xx) leaves open whether this
+         * is actually Ollama instead - worth one more try. */
+        try {
+          const data = await getJson(`${base}/api/tags`, timeout);
+          result.online = true;
+          result.backend = 'Ollama';
+          result.models = (data?.models ?? []).map((m) => m.name).filter(Boolean);
+          result.error = null;
+        } catch (err2) {
+          result.error = String(err2?.message || err2);
+        }
+      }
     }
   }
 
