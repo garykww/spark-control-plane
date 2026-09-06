@@ -568,21 +568,61 @@
       container: /workspace/ComfyUI/output
     - host: ~/Workspace/comfyui/workflows
       container: /workspace/ComfyUI/user/default/workflows
+    # LoRAs are yours, not the recipe's: they come from anywhere, are small
+    # enough to sit outside the HuggingFace cache, and the weights below cannot
+    # express them because `files` binds ONE FILE at a time from one repo. A
+    # directory mount instead, so anything dropped in survives the container -
+    # without it a LoRA copied into the container dies with it.
+    - host: ~/Workspace/comfyui/models/loras
+      container: /workspace/ComfyUI/models/loras
   weights:
-    # The int8 tier of the fl2va checkpoint set - the launcher's default. Sizes
-    # measured from the files on the Spark, 2026-08-30. The repo holds every
-    # quantisation tier, so this fetches four named files rather than the ~500 GB
-    # whole. Each is bound read-only onto mountBase/<file>, which is the layout
-    # ComfyUI loads from; the cache's own blob-and-symlink layout is not.
+    # Named files, not the repo: it holds every quantisation tier and pulling
+    # the lot would be ~471 GB of safetensors. Each is bound read-only onto
+    # mountBase/<file>, which is the layout ComfyUI loads from; the cache's own
+    # blob-and-symlink layout is not. Sizes measured from the files on the
+    # Spark - the first four on 2026-08-30, the rest on 2026-09-06.
+    #
+    # MOUNTING IS NOT LOADING. Everything here appears in ComfyUI's model
+    # dropdowns and costs nothing until a workflow selects it, so the extra
+    # tiers are alternatives to pick between, not additions to the peak. The
+    # memoryGB above is still the measured figure for the fl2va int8 set; the
+    # smaller tiers should come in under it and have not been measured.
+    #
+    # THE TIERS, AND WHAT THEY TRADE. "pruned" prunes nothing from the
+    # transformer - all 50 blocks, hidden 5376, 56 heads are identical. It
+    # replaces the adaLN timestep path: the full model projects a 2688-dim
+    # timestep embedding to 96768 modulation values per block, the pruned one
+    # looks up a rank-8 code from a 1025-entry adaln_t_table and projects from
+    # 8. That is 50 x 96768 x (2688 - 8) = 12.97B parameters, which at int8 is
+    # exactly the 34.0 -> 21.0 GB difference. Modulation depends only on the
+    # timestep, so the map is smooth and low-rank by construction; it is a
+    # compression of a lookup table, not of the generative weights, and it is
+    # NOT tied to a step count - the table covers 1025 timesteps.
+    #
+    # ref2va is a different task family, not a tier: reference-to-video against
+    # fl2va's first/last-frame. Same size, same quantisation.
+    #
+    # The nvfp4_awq text encoder is the one swap that is a real unknown. It
+    # changes both the numeric format and the METHOD - AWQ is activation-aware
+    # and calibrated, against the rotation-plus-int8 of the convrot files - so
+    # unlike the pruned pair its quality shift is not bounded by arithmetic.
+    # NVFP4 is native on GB10 rather than emulated, which is the upside.
     - repo: Comfy-Org/MiniMax-H3
-      sizeGB: 66.9
+      sizeGB: 124.6
       measured: true
       mountBase: /workspace/ComfyUI/models
       files:
+        # The measured default: fl2va int8, and what memoryGB describes.
         - diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors
         - text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
         - vae/minimax_h3_video_vae_fp16.safetensors
         - vae/minimax_h3_audio_vae_fp32.safetensors
+        # 21.0 GB against the 34.0 above, same quantisation. See the note.
+        - diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+        # Reference-to-video, the other task family.
+        - diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
+        # 15.7 GB against the 27.1 above. The least predictable swap here.
+        - text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
   notes:
     - >-
       Licensed only outside the EU, UK, South Korea and the United States. Read
@@ -591,8 +631,16 @@
       Opens ComfyUI's own web UI on the port below, not an API endpoint. It has
       no authentication, so treat the port as open to whoever can reach it.
     - >-
-      Inputs, outputs and saved workflows live under ~/Workspace/comfyui on the
-      node, one subfolder each. The run creates them if they are missing.
+      Inputs, outputs, saved workflows and LoRAs live under ~/Workspace/comfyui
+      on the node, one subfolder each. The run creates them if they are
+      missing. Drop a LoRA in models/loras and it shows up in the dropdowns
+      after a restart, and survives the container being replaced.
+    - >-
+      Seven weight files are mounted, not one set: the measured fl2va int8
+      default, a pruned fl2va at 21.0 GB against its 34.0, the ref2va family
+      for reference-to-video, and an NVFP4 text encoder at 15.7 GB against
+      27.1. Mounting is not loading - pick one combination per workflow. Only
+      the fl2va int8 set has a measured memory figure.
     - >-
       Its weights are ordinary HuggingFace cache entries, so the cache panel
       lists and can delete them. Deleting the repo there removes the files a
