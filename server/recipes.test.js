@@ -848,8 +848,10 @@ test('the shipped service recipe keeps its weights in the cache', () => {
   const comfy = recipeById('comfyui-minimax-h3');
 
   assert.equal(comfy.runtime, 'service');
-  assert.equal(comfy.weights.length, 1);
+  assert.equal(comfy.weights.length, 2);
   assert.equal(comfy.weights[0].mountBase, '/workspace/ComfyUI/models');
-  /* No directory of weights to bind - only the writable dirs are volumes. */
-  assert.equal(comfy.volumes.some((v) => v.container.endsWith('/models')), false);
+  assert.equal(comfy.weights[1].mountBase, '/workspace/ComfyUI/models/loras');
+  /* The turbo LoRAs are auto-fetched, but the loras/ directory is ALSO a
+   * writable volume mount, for anything dropped in by hand. */
+  assert.equal(comfy.volumes.some((v) => v.container.endsWith('/models/loras')), true);
 });

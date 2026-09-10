@@ -534,6 +534,34 @@
   #
   # This figure is for the workflow as measured. Activations scale with output
   # resolution and duration, so a longer or larger generation needs more.
+  #
+  # REFERENCES are where "more" stops being marginal. MEASURED on the same GB10,
+  # 2026-09-06, on a ref2va run at 480x864/15s - a SMALLER output than the one
+  # above - carrying two reference images, a 15s reference video and a 15s
+  # reference audio:
+  #
+  #   121.7 GiB pool exhausted, plus all 16 GiB of swap consumed
+  #   -> died in VAEDecode after 7h32m, nothing written
+  #
+  # H3 packs text, video, audio and every reference into ONE sequence and
+  # attends over the whole of it at every step (comfy/ldm/minimax/model.py,
+  # PackedLayout). A reference is not conditioning held off to the side; it is
+  # sequence, resident for the entire run. That 15s reference video alone was
+  # 107,856 of the 172,589 tokens - 62% of the sequence, against 25% spent on
+  # the video actually being generated.
+  #
+  # Worse, that reference was carried at 768x1344 while the output was 480x864.
+  # Reference videos are put on a forced 768-short-edge canvas regardless of what
+  # is being generated (adapt_canvas, comfy_extras/nodes_minimax_h3.py), and
+  # unlike reference IMAGES they expose no size control. The way out is upstream:
+  # the same function falls back to the source size when the source is smaller
+  # than the canvas it would otherwise pick, so an ImageScale to the generation's
+  # own size ahead of the ref_video input is honoured. That takes the sequence
+  # from 172,589 tokens to 98,420 and the work per step down 2.84x.
+  #
+  # 100 GB is left as the figure because it is the measured one and the planner
+  # reserves against it, but a ref2va workflow carrying video references does
+  # not fit beside anything else on this box, and may not fit alone.
   memoryGB: 100
   memoryMeasured: true
   # Replaces the image's CMD. --listen/--port are its own defaults, repeated
@@ -546,11 +574,59 @@
   # partial unloading it was meant to, and the run was slower than the default.
   # The memoryGB figure below is the default configuration's, so leaving the
   # flag off keeps the plan and the container in agreement.
+  #
+  # --use-ck-attention is the largest speed lever here and is also NOT set, for
+  # the reason the image's Dockerfile leaves SageAttention off: it changes
+  # attention numerics and has not been validated against a real generation on
+  # sm_121. What is known, from the 2026-09-06 run:
+  #
+  #   1316 s/step, steady across 20 steps  -> ~36 TFLOPS effective
+  #   attention is 89% of the DiT's FLOPs at that sequence length
+  #
+  # 36 TFLOPS is about 15% of GB10's bf16 peak, so the headroom is real, and
+  # comfy-kitchen already ships an NVIDIA-authored INT8 SDPA that ComfyUI
+  # dispatches to with this flag (comfy/ldm/modules/attention.py). It is INT8,
+  # NOT the FP8 PV path with the sm_120 accuracy bug the Dockerfile warns about.
+  # Validate output quality on a short clip, then set it here.
+  #
+  # --disable-pinned-memory IS set, and is the one flag here that exists to stop
+  # a failure rather than to go faster. ComfyUI budgets pinned host memory as
+  #
+  #   max(ram*0.40, min(ram*0.90, ram-4GB, ram+swap-16GB))
+  #
+  # (model_management.py) which on this box is ~109.5 GB of a 121.7 GB pool -
+  # note that it counts SWAP into the budget. Pinned pages cannot be swapped, so
+  # as it pins, everything else is pushed into swap until swap is gone too; that
+  # is the state the 2026-09-06 run died in, and the log line to check for is
+  # "Enabled pinned memory 112147.0". The copy this pinning accelerates is
+  # host-to-device, which on GB10 does not cross a bus at all - both sides are
+  # the same LPDDR5X. So it costs the headroom the run needed and buys little.
+  #
+  # The failure is measured; that this flag prevents it is reasoned, not yet
+  # confirmed. It is set because the alternative on a bad day is losing seven
+  # hours of sampling at the decode step, which is what happened. It also means
+  # the container is no longer bit-for-bit what memoryGB was measured on, which
+  # the --highvram note above leans on; the difference should not move that
+  # figure, since pinning registers allocations that already exist rather than
+  # making new ones. Re-measure if that turns out wrong.
+  #
+  # THREE MORE were tried from github.com/luix93/DGX-Spark-ComfyUI (a
+  # from-scratch build for the same GB10/sm_121 hardware) and REVERTED after
+  # testing here: --disable-mmap (paired with a Dockerfile patch to
+  # comfy/utils.py removing a copy=True that forces a wasted duplicate
+  # allocation on unified memory), --disable-dynamic-vram (keeps a loaded
+  # model resident rather than unloading between prompts), and --reserve-vram
+  # 1. Observed slower on this box with all three set, same failure shape as
+  # --highvram above: a plausible-sounding lever from someone else's box that
+  # does not carry over. Not root-caused which one (or whether it's the
+  # combination) is responsible - if revisiting, test them individually rather
+  # than as a batch.
   command:
     - --listen
     - 0.0.0.0
     - --port
     - "8188"
+    - --disable-pinned-memory
   readiness:
     # ComfyUI has no authentication of its own; the run probes this bare.
     path: /system_stats
@@ -568,21 +644,79 @@
       container: /workspace/ComfyUI/output
     - host: ~/Workspace/comfyui/workflows
       container: /workspace/ComfyUI/user/default/workflows
+    # Writable, so anything dropped in survives the container - without it a
+    # LoRA copied straight into the running container dies with it. The turbo
+    # LoRAs below are auto-fetched read-only INTO this same directory (Docker
+    # nests a later, more specific bind inside an earlier directory one); this
+    # mount is for anything else - a LoRA from anywhere else, small enough to
+    # sit outside the HuggingFace cache, dropped in by hand.
+    - host: ~/Workspace/comfyui/models/loras
+      container: /workspace/ComfyUI/models/loras
   weights:
-    # The int8 tier of the fl2va checkpoint set - the launcher's default. Sizes
-    # measured from the files on the Spark, 2026-08-30. The repo holds every
-    # quantisation tier, so this fetches four named files rather than the ~500 GB
-    # whole. Each is bound read-only onto mountBase/<file>, which is the layout
-    # ComfyUI loads from; the cache's own blob-and-symlink layout is not.
+    # Named files, not the repo: it holds every quantisation tier and pulling
+    # the lot would be ~471 GB of safetensors. Each is bound read-only onto
+    # mountBase/<file>, which is the layout ComfyUI loads from; the cache's own
+    # blob-and-symlink layout is not. Sizes measured from the files on the
+    # Spark - the first four on 2026-08-30, the rest on 2026-09-06.
+    #
+    # MOUNTING IS NOT LOADING. Everything here appears in ComfyUI's model
+    # dropdowns and costs nothing until a workflow selects it, so the extra
+    # tiers are alternatives to pick between, not additions to the peak. The
+    # memoryGB above is still the measured figure for the fl2va int8 set; the
+    # smaller tiers should come in under it and have not been measured.
+    #
+    # THE TIERS, AND WHAT THEY TRADE. "pruned" prunes nothing from the
+    # transformer - all 50 blocks, hidden 5376, 56 heads are identical. It
+    # replaces the adaLN timestep path: the full model projects a 2688-dim
+    # timestep embedding to 96768 modulation values per block, the pruned one
+    # looks up a rank-8 code from a 1025-entry adaln_t_table and projects from
+    # 8. That is 50 x 96768 x (2688 - 8) = 12.97B parameters, which at int8 is
+    # exactly the 34.0 -> 21.0 GB difference. Modulation depends only on the
+    # timestep, so the map is smooth and low-rank by construction; it is a
+    # compression of a lookup table, not of the generative weights, and it is
+    # NOT tied to a step count - the table covers 1025 timesteps.
+    #
+    # ref2va is a different task family, not a tier: reference-to-video against
+    # fl2va's first/last-frame. Same size, same quantisation.
+    #
+    # The nvfp4_awq text encoder is the one swap that is a real unknown. It
+    # changes both the numeric format and the METHOD - AWQ is activation-aware
+    # and calibrated, against the rotation-plus-int8 of the convrot files - so
+    # unlike the pruned pair its quality shift is not bounded by arithmetic.
+    # NVFP4 is native on GB10 rather than emulated, which is the upside.
     - repo: Comfy-Org/MiniMax-H3
-      sizeGB: 66.9
+      sizeGB: 124.6
       measured: true
       mountBase: /workspace/ComfyUI/models
       files:
+        # The measured default: fl2va int8, and what memoryGB describes.
         - diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors
         - text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
         - vae/minimax_h3_video_vae_fp16.safetensors
         - vae/minimax_h3_audio_vae_fp32.safetensors
+        # 21.0 GB against the 34.0 above, same quantisation. See the note.
+        - diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+        # Reference-to-video, the other task family.
+        - diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
+        # 15.7 GB against the 27.1 above. The least predictable swap here.
+        - text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+    # Step-distillation LoRAs, auto-fetched into the loras/ directory mount
+    # above rather than left to be dropped in by hand: these four are what the
+    # bundled fl2va/ref2va checkpoints actually pair with (4-step and 8-step
+    # turbo tiers for each), so a fresh deployment has them without a manual
+    # curl step first. A workflow still chooses whether to use any of them by
+    # wiring a LoraLoaderModelOnly node to it - fetching them here does not by
+    # itself change what a run samples. Sizes are the repo's own file listing
+    # (HuggingFace byte counts are exact, not an estimate), 2026-09-10.
+    - repo: lightx2v/Minimax-h3-Turbo
+      sizeGB: 7.81
+      measured: true
+      mountBase: /workspace/ComfyUI/models/loras
+      files:
+        - minimax_h3_fl2v_turbo_4step_v1.1_768p_comfyui_bf16.safetensors
+        - minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors
+        - minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors
+        - minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors
   notes:
     - >-
       Licensed only outside the EU, UK, South Korea and the United States. Read
@@ -591,8 +725,212 @@
       Opens ComfyUI's own web UI on the port below, not an API endpoint. It has
       no authentication, so treat the port as open to whoever can reach it.
     - >-
-      Inputs, outputs and saved workflows live under ~/Workspace/comfyui on the
-      node, one subfolder each. The run creates them if they are missing.
+      Inputs, outputs, saved workflows and LoRAs live under ~/Workspace/comfyui
+      on the node, one subfolder each. The run creates them if they are
+      missing. Drop any other LoRA in models/loras and it shows up in the
+      dropdowns after a restart, and survives the container being replaced.
+    - >-
+      Eleven weight files are mounted, not one set: the measured fl2va int8
+      default, a pruned fl2va at 21.0 GB against its 34.0, the ref2va family
+      for reference-to-video, an NVFP4 text encoder at 15.7 GB against 27.1,
+      and four turbo LoRAs (fl2v/ref2v x 4-step/8-step). Mounting is not
+      loading - pick one combination per workflow. Only the fl2va int8 set has
+      a measured memory figure.
+    - >-
+      Its weights are ordinary HuggingFace cache entries, so the cache panel
+      lists and can delete them. Deleting the repo there removes the files a
+      running container is reading.
+    - >-
+      Sampling cost grows with the SQUARE of the packed sequence, and every
+      reference is part of that sequence at every step. Measured at 480x864/15s
+      with a 15s reference video: 1316 s per step, 7h19m for 20 steps. Price a
+      run before starting it rather than after.
+    - >-
+      Scale reference video frames to the generation's canvas before feeding
+      them in. Reference videos ignore the output size and are encoded on a
+      forced 768-short-edge canvas, so a 480x864 run carries its reference at
+      768x1344 for 62% of the sequence. An ImageScale ahead of ref_video cuts
+      the work per step by 2.84x.
+    - >-
+      Reference video is assumed to be 24 fps. A 30 fps clip is silently
+      truncated to the first frame_count frames - 12s of a 15s reference - then
+      played over the full duration against an untruncated soundtrack, so the
+      motion desyncs. Resample references to 24 fps first.
+    - >-
+      Use a 4-step turbo LoRA unless the output needs the full schedule. Steps
+      are the one cost here that scales linearly and is free to change.
+    - >-
+      A failed decode takes the whole run with it, and smaller tiles are not the
+      answer: the H3 VAE tiles internally and was already doing so when the
+      2026-09-06 run died, inside one tile. Headroom is the fix. Restart the
+      container afterwards - the CUDA context does not survive it.
+
+
+# The same recipe with SageAttention on. A SEPARATE id rather than a flag on
+# comfyui-minimax-h3 above: --use-sage-attention only works against an image
+# actually built with SageAttention installed, and comfyui-minimax-h3:local
+# (the tag the plain recipe expects) is not that image. Pointing both recipes
+# at one tag would mean whichever was built last silently determines what the
+# other one does; a second tag keeps them independent, and the plain recipe
+# keeps working for anyone who has not rebuilt anything.
+#
+# Note this is a DIFFERENT lever from --use-ck-attention, discussed above on
+# the plain recipe and deliberately left unset there: ck-attention is an
+# NVIDIA-authored INT8 SDPA that ships in the base image already (comfy-kitchen,
+# comfy/ldm/modules/attention.py) and needs no rebuild; SageAttention is the
+# FP8 PV path the Dockerfile warns about (Comfy-Org/ComfyUI#15263) and needs
+# this separate image. Neither has been validated against the other on this
+# box - they have not been run together.
+#
+# Published on Docker Hub as garykww/comfyui-minimax-h3:sm121-sage (and
+# :latest, same digest) - a node with no local image pulls it like any other
+# recipe's image, no out-of-band build required. To rebuild it yourself
+# instead (e.g. to audit the Dockerfile or target a different arch), from the
+# comfyui-minimax-h3 repo:
+#   docker build -t comfyui-minimax-h3:sm121-sage --build-arg ENABLE_SAGEATTENTION=1 .
+# See that Dockerfile's own comments for what the build arg actually does -
+# SageAttention 2.2.0 is built from source (PyPI tops out at 1.0.6, with no
+# sm_121 kernels), targeting TORCH_CUDA_ARCH_LIST='8.9;12.0', with a one-line
+# runtime dispatch patch for sm_121. A plain `pip install sageattention`
+# imports fine but raises `AssertionError: SM89 kernel is not available` on
+# first use - the source build is required, not optional.
+#
+# VERIFIED on nv-spark-01, built and tested twice:
+#
+# 2026-09-10: this exact image, built fresh from the Dockerfile fix above (not
+# docker-committed) and tagged sm121-sage. The build itself produced a real
+# 22.9MB compiled wheel (the broken PyPI-arch build silently produces a ~3MB
+# no-op one instead) and passed its own `sageattention imported OK` check;
+# separately run against the real GPU afterward (torch.cuda.get_device_capability
+# == (12, 1), i.e. sm_121): finite output, max abs diff 0.069 vs. reference
+# attention - same order of magnitude as 2026-09-08/09 below, still just
+# quantisation noise, not a correctness failure. A full ComfyUI generation was
+# not re-run against this tag, and NEITHER run tested it against a reference-
+# carrying workflow - the pinned-memory failure above is a separate, unrelated
+# risk that applies here identically; --disable-pinned-memory is carried over
+# below for the same reason.
+#
+# 2026-09-08/09: an earlier, hand-committed image (docker commit, not this
+# Dockerfile - see CHANGELOG-nv-spark-01.md in that repo) verified end-to-end
+# through the real draft and quality presets: finite output, max abs diff
+# ~0.037 vs. reference attention; draft ~10% faster (attention is a small
+# share of a 4-step render, so the win is modest there); quality should see
+# more since attention is a larger share of a 20-step render, but that delta
+# was not precisely measured.
+#
+# Still opt-in either way - the underlying accuracy concern
+# (Comfy-Org/ComfyUI#15263) is a known issue on sm_120-class Blackwell FP8 PV
+# kernels in general, just not reproduced in either verification above.
+
+- id: comfyui-minimax-h3-sage
+  runtime: service
+  name: ComfyUI · MiniMax H3 (SageAttention)
+  summary: >-
+    Same as ComfyUI · MiniMax H3, with SageAttention for faster sampling.
+  image:
+    # Published on Docker Hub - see this recipe's header comment for how it
+    # was built and what has been verified against it.
+    ref: garykww/comfyui-minimax-h3:sm121-sage
+  # A distinct container name from comfyui-minimax-h3's, so both recipes can
+  # run side by side without one's start colliding with the other's container.
+  container: comfyui-h3-sage
+  port: 8188
+  containerPort: 8188
+  ipcHost: true
+  # Unmeasured with SageAttention specifically, but inherited rather than
+  # guessed: SageAttention changes attention's compute precision, not the
+  # memory management strategy behind the plain recipe's measured figure
+  # (staged host copies + device-resident weights, both specific to unified
+  # memory) - see that recipe's comment for the full breakdown, including the
+  # 2026-09-06 pinned-memory OOM this recipe also guards against below.
+  memoryGB: 100
+  memoryMeasured: false
+  # Same as the plain recipe's command, plus --use-sage-attention.
+  # --disable-pinned-memory carries over unchanged: see comfyui-minimax-h3's
+  # comment - it guards against a real OOM, unrelated to which attention
+  # kernel is in use. --disable-mmap, --disable-dynamic-vram and --reserve-vram
+  # were tried and REVERTED here too, for the same reason as the plain
+  # recipe: observed slower on this box. See that recipe's comment.
+  command:
+    - --listen
+    - 0.0.0.0
+    - --port
+    - "8188"
+    - --disable-pinned-memory
+    - --use-sage-attention
+  readiness:
+    path: /system_stats
+    auth: none
+  volumes:
+    - host: ~/Workspace/comfyui/input
+      container: /workspace/ComfyUI/input
+    - host: ~/Workspace/comfyui/output
+      container: /workspace/ComfyUI/output
+    - host: ~/Workspace/comfyui/workflows
+      container: /workspace/ComfyUI/user/default/workflows
+    # Same rationale as the plain recipe: writable for anything dropped in by
+    # hand; the turbo LoRAs below are auto-fetched read-only into this same
+    # directory.
+    - host: ~/Workspace/comfyui/models/loras
+      container: /workspace/ComfyUI/models/loras
+  weights:
+    # Identical to comfyui-minimax-h3's - same checkpoints, same tiers, same
+    # sizes, same turbo LoRAs. SageAttention changes how attention is
+    # computed, not which weights a workflow needs.
+    - repo: Comfy-Org/MiniMax-H3
+      sizeGB: 124.6
+      measured: true
+      mountBase: /workspace/ComfyUI/models
+      files:
+        - diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors
+        - text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
+        - vae/minimax_h3_video_vae_fp16.safetensors
+        - vae/minimax_h3_audio_vae_fp32.safetensors
+        - diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+        - diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
+        - text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+    - repo: lightx2v/Minimax-h3-Turbo
+      sizeGB: 7.81
+      measured: true
+      mountBase: /workspace/ComfyUI/models/loras
+      files:
+        - minimax_h3_fl2v_turbo_4step_v1.1_768p_comfyui_bf16.safetensors
+        - minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors
+        - minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors
+        - minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors
+  notes:
+    - >-
+      Licensed only outside the EU, UK, South Korea and the United States. Read
+      the MiniMax H3 Community License before using its output for anything.
+    - >-
+      Pulls garykww/comfyui-minimax-h3:sm121-sage from Docker Hub, built with
+      --build-arg ENABLE_SAGEATTENTION=1 (see the Dockerfile in the
+      comfyui-minimax-h3 repo). Pointing this recipe at a plain
+      comfyui-minimax-h3:local-derived image instead fails at startup, not
+      silently - ComfyUI exits when --use-sage-attention names a package that
+      is not installed.
+    - >-
+      Verified on sm_121 (nv-spark-01): this image ran a real sageattn() call
+      correctly on 2026-09-10 (max abs diff 0.069 vs. reference attention); an
+      earlier hand-committed image saw draft ~10% faster on 2026-09-08/09.
+      Neither tested a reference-carrying workflow - the 2026-09-06
+      pinned-memory OOM below applies here identically, hence
+      --disable-pinned-memory above too.
+    - >-
+      Opens ComfyUI's own web UI on the port below, not an API endpoint. It has
+      no authentication, so treat the port as open to whoever can reach it.
+    - >-
+      Inputs, outputs, saved workflows and LoRAs live under ~/Workspace/comfyui
+      on the node, one subfolder each. The run creates them if they are
+      missing. Drop any other LoRA in models/loras and it shows up in the
+      dropdowns after a restart, and survives the container being replaced.
+    - >-
+      Eleven weight files are mounted, not one set: the measured fl2va int8
+      default, a pruned fl2va at 21.0 GB against its 34.0, the ref2va family
+      for reference-to-video, an NVFP4 text encoder at 15.7 GB against 27.1,
+      and four turbo LoRAs (fl2v/ref2v x 4-step/8-step). Mounting is not
+      loading - pick one combination per workflow. Only the fl2va int8 set has
+      a measured memory figure.
     - >-
       Its weights are ordinary HuggingFace cache entries, so the cache panel
       lists and can delete them. Deleting the repo there removes the files a
