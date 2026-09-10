@@ -317,7 +317,8 @@ test('a service fetches its weights into the HuggingFace cache', () => {
   const script = serviceScript();
 
   assert.equal(script.includes('--local-dir'), false);
-  assert.equal(script.match(/--include /g).length, SERVICE.weights[0].files.length);
+  const totalFiles = SERVICE.weights.reduce((sum, entry) => sum + entry.files.length, 0);
+  assert.equal(script.match(/--include /g).length, totalFiles);
   /* Its total is the declared figure - a dry run would price the whole repo,
    * which holds every quantisation tier. */
   assert.equal(script.includes('--dry-run'), false);
@@ -337,15 +338,18 @@ test('the snapshot path is resolved on the node, not hardcoded', () => {
 
 test('every weight file is mounted read-only onto the path the service expects', () => {
   const script = serviceScript();
-  const entry = SERVICE.weights[0];
 
-  for (const file of entry.files) {
-    assert.ok(
-      script.includes(`-v "$SNAP_0/${file}":'${entry.mountBase}/${file}':ro`),
-      `expected ${file} to be mounted`,
-    );
-  }
-  assert.equal(script.match(/:ro/g).length, entry.files.length);
+  let totalFiles = 0;
+  SERVICE.weights.forEach((entry, i) => {
+    totalFiles += entry.files.length;
+    for (const file of entry.files) {
+      assert.ok(
+        script.includes(`-v "$SNAP_${i}/${file}":'${entry.mountBase}/${file}':ro`),
+        `expected ${file} to be mounted`,
+      );
+    }
+  });
+  assert.equal(script.match(/:ro/g).length, totalFiles);
 });
 
 test('a service is probed without an Authorization header', () => {
