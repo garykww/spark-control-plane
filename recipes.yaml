@@ -610,35 +610,23 @@
   # figure, since pinning registers allocations that already exist rather than
   # making new ones. Re-measure if that turns out wrong.
   #
-  # THREE MORE, from github.com/luix93/DGX-Spark-ComfyUI (a from-scratch build
-  # for the same GB10/sm_121 hardware) - none independently measured here, so
-  # treat memoryGB and the incident notes above as still the operative figures
-  # until these are:
-  #
-  #   --disable-mmap paired with a Dockerfile patch to comfy/utils.py (see its
-  #   comment there) that removes a copy=True forcing a wasted duplicate
-  #   allocation on unified memory - plausibly overlaps with the "same bytes
-  #   counted twice" effect already described above for dynamic VRAM loading,
-  #   untested whether it accounts for some, all, or none of that gap.
-  #
-  #   --disable-dynamic-vram keeps a loaded model resident rather than
-  #   unloading it between prompts - a DIFFERENT code path from --highvram
-  #   above (which was measured here and rejected for not actually stopping
-  #   partial unloading, and running slower). Faster prompt-to-prompt changes
-  #   if it fits; the failure mode if it does not has not been tested.
-  #
-  #   --reserve-vram 1 holds back 1 GB for the system on top of whatever
-  #   --disable-dynamic-vram keeps resident - a minor, low-risk margin.
+  # THREE MORE were tried from github.com/luix93/DGX-Spark-ComfyUI (a
+  # from-scratch build for the same GB10/sm_121 hardware) and REVERTED after
+  # testing here: --disable-mmap (paired with a Dockerfile patch to
+  # comfy/utils.py removing a copy=True that forces a wasted duplicate
+  # allocation on unified memory), --disable-dynamic-vram (keeps a loaded
+  # model resident rather than unloading between prompts), and --reserve-vram
+  # 1. Observed slower on this box with all three set, same failure shape as
+  # --highvram above: a plausible-sounding lever from someone else's box that
+  # does not carry over. Not root-caused which one (or whether it's the
+  # combination) is responsible - if revisiting, test them individually rather
+  # than as a batch.
   command:
     - --listen
     - 0.0.0.0
     - --port
     - "8188"
     - --disable-pinned-memory
-    - --disable-mmap
-    - --disable-dynamic-vram
-    - --reserve-vram
-    - "1"
   readiness:
     # ComfyUI has no authentication of its own; the run probes this bare.
     path: /system_stats
@@ -858,22 +846,17 @@
   memoryGB: 100
   memoryMeasured: false
   # Same as the plain recipe's command, plus --use-sage-attention.
-  # --disable-pinned-memory, --disable-mmap, --disable-dynamic-vram and
-  # --reserve-vram carry over unchanged: see comfyui-minimax-h3's comment for
-  # each - all are about ComfyUI's own memory management, unrelated to which
-  # attention kernel is in use. The copy=False Dockerfile patch --disable-mmap
-  # pairs with is unconditional (not gated behind ENABLE_SAGEATTENTION), so
-  # this image has it too.
+  # --disable-pinned-memory carries over unchanged: see comfyui-minimax-h3's
+  # comment - it guards against a real OOM, unrelated to which attention
+  # kernel is in use. --disable-mmap, --disable-dynamic-vram and --reserve-vram
+  # were tried and REVERTED here too, for the same reason as the plain
+  # recipe: observed slower on this box. See that recipe's comment.
   command:
     - --listen
     - 0.0.0.0
     - --port
     - "8188"
     - --disable-pinned-memory
-    - --disable-mmap
-    - --disable-dynamic-vram
-    - --reserve-vram
-    - "1"
     - --use-sage-attention
   readiness:
     path: /system_stats
