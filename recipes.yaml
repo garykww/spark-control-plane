@@ -589,44 +589,49 @@
   # NOT the FP8 PV path with the sm_120 accuracy bug the Dockerfile warns about.
   # Validate output quality on a short clip, then set it here.
   #
-  # --disable-pinned-memory was set, then REVERTED (2026-09-10) at explicit
-  # request after it was observed slower alongside the three flags below - it
-  # existed to stop a failure rather than to go faster, and removing it
-  # REINTRODUCES A MEASURED RISK, not a merely theoretical one:
-  #
-  # ComfyUI budgets pinned host memory as
+  # --disable-pinned-memory IS set, and is the one flag here that exists to
+  # stop a failure rather than to go faster. ComfyUI budgets pinned host
+  # memory as
   #   max(ram*0.40, min(ram*0.90, ram-4GB, ram+swap-16GB))
   # (model_management.py) which on this box is ~109.5 GB of a 121.7 GB pool -
   # note that it counts SWAP into the budget. Pinned pages cannot be swapped,
   # so as it pins, everything else is pushed into swap until swap is gone too;
   # that is the state the 2026-09-06 run died in after 7h19m of sampling
   # (VAEDecode, nothing written), and the log line to check for is "Enabled
-  # pinned memory 112147.0". The copy this pinning accelerates is
-  # host-to-device, which on GB10 does not cross a bus at all - both sides are
-  # the same LPDDR5X, so the pinning buys little for what it costs.
+  # pinned memory 112147.0".
   #
-  # That failure is measured; that --disable-pinned-memory prevented it was
-  # reasoned, not confirmed - so its removal was not verified to cause the
-  # slowdown, only requested after it. If a run dies in decode after burning
-  # hours, re-add this flag first before chasing anything else - it is the
-  # only change here with an actual incident behind it, not a borrowed guess.
+  # Was briefly REVERTED (2026-09-10), then RE-CONFIRMED and RE-ADDED
+  # (2026-09-12) after isolated A/B testing against the draft T2V workflow
+  # (workflows/api-examples/minimax_h3_t2v.json in the comfyui-minimax-h3
+  # repo; full logs in that repo's MEMORY_FLAG_BENCHMARKS.md):
+  #
+  #   default (pinning on):  50.45s / 51.09s total, 42.72 GiB host cgroup peak
+  #   --disable-pinned-memory: 49.01s total,          4.83 GiB host cgroup peak
+  #
+  # GPU device memory was IDENTICAL either way (39435 MiB) - the ~38 GB
+  # difference is entirely a host-side duplicate the pinning creates, not
+  # anything the GPU needs. Same speed, same GPU usage, ~38 GB less host
+  # memory pressure: a strict improvement on this workload, not just a
+  # theoretical fix. The copy this pinning accelerates is host-to-device,
+  # which on GB10 does not cross a bus at all - both sides are the same
+  # LPDDR5X - so the measurement matches the reasoning.
   #
   # THREE MORE were tried from github.com/luix93/DGX-Spark-ComfyUI (a
   # from-scratch build for the same GB10/sm_121 hardware) and REVERTED after
-  # testing here: --disable-mmap (paired with a Dockerfile patch to
+  # testing here as a batch: --disable-mmap (paired with a Dockerfile patch to
   # comfy/utils.py removing a copy=True that forces a wasted duplicate
-  # allocation on unified memory), --disable-dynamic-vram (keeps a loaded
-  # model resident rather than unloading between prompts), and --reserve-vram
-  # 1. Observed slower on this box with all three set, same failure shape as
-  # --highvram above: a plausible-sounding lever from someone else's box that
-  # does not carry over. Not root-caused which one (or whether it's the
-  # combination) is responsible - if revisiting, test them individually rather
-  # than as a batch.
+  # allocation on unified memory), --disable-dynamic-vram, and --reserve-vram
+  # 1. Observed slower with all three set, same failure shape as --highvram
+  # above. --disable-dynamic-vram was re-tested alone and confirmed genuinely
+  # bad (3.24x slower, isolated to model loading - see
+  # MEMORY_FLAG_BENCHMARKS.md); --disable-mmap and --reserve-vram were not
+  # re-tested individually, so the batch reversion stands for those two.
   command:
     - --listen
     - 0.0.0.0
     - --port
     - "8188"
+    - --disable-pinned-memory
   readiness:
     # ComfyUI has no authentication of its own; the run probes this bare.
     path: /system_stats
@@ -846,16 +851,17 @@
   memoryGB: 100
   memoryMeasured: false
   # Same as the plain recipe's command, plus --use-sage-attention.
-  # --disable-pinned-memory was reverted here too, for the same reason and
-  # with the same reintroduced OOM risk - see comfyui-minimax-h3's comment,
-  # which is the operative one. --disable-mmap, --disable-dynamic-vram and
-  # --reserve-vram were tried and reverted as well: observed slower on this
-  # box.
+  # --disable-pinned-memory carries over unchanged: see comfyui-minimax-h3's
+  # comment for the measured A/B (same speed, ~38 GB less host memory, no
+  # downside found). --disable-mmap, --disable-dynamic-vram and --reserve-vram
+  # were tried and reverted - see that recipe's comment for what was and
+  # wasn't re-tested individually.
   command:
     - --listen
     - 0.0.0.0
     - --port
     - "8188"
+    - --disable-pinned-memory
     - --use-sage-attention
   readiness:
     path: /system_stats
