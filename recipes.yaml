@@ -1572,8 +1572,11 @@
     --context-length: 262144
     # One, like the vLLM recipe: this configuration wins on single-stream
     # latency. Their own figures scale well past it - 360 tok/s aggregate at 16
-    # streams - but a sixteenth slot costs both pool and recurrent state, so
-    # raise it in the panel and watch the estimate rather than shipping it.
+    # streams - and raising it in the panel is cheap here, because SGLang treats
+    # this as an ADMISSION limit rather than an allocation: every request is
+    # served out of one pool, so a slot costs the 1.26 GB of state below and no
+    # pool at all. What it does not buy is a pool deep enough for every slot to
+    # be full-length at once - raise the memory fraction by hand for that.
     --max-running-requests: 1
     --speculative-algorithm: DFLASH
     # The drafter is declared above for planning and named here for the engine.
@@ -1625,3 +1628,9 @@
       depends on what else is resident: the same fraction that fills an idle
       Spark left a 16,633-token pool beside a running vLLM server. The panel
       prices it against free memory for that reason.
+    - >-
+      Raising the request count is cheap - one shared pool, so a slot costs
+      state and not pool - but it does not widen the pool. An input longer than
+      the pool comes back as HTTP 400, not as a slower answer; raise the memory
+      fraction above the computed minimum when several long prompts have to be
+      in flight at once.

@@ -1017,3 +1017,55 @@ test('the shipped sglang recipe is the same model on the other engine', () => {
   assert.equal(sg.volumes.some((v) => v.container === '/root/.cache/sglang'), true);
   assert.equal(sg.image.build?.run.length, 6);
 });
+
+/*
+ * The request slider, and what it is allowed to cost.
+ *
+ * SGLang serves every request out of one pool and uses --max-running-requests
+ * as an admission limit, so raising it buys state, not pool. Pricing it as
+ * "every request at full context at once" made the upstream recipe's own
+ * profiles look impossible - it runs 4 requests against a 413,460-token pool.
+ */
+test('a shared pool is sized for one full-length request, whatever the concurrency', () => {
+  const one = planOf(sglang(), roomyNode(), [], { contextLength: 262144, maxRequests: 1 });
+  const four = planOf(sglang(), roomyNode(), [], { contextLength: 262144, maxRequests: 4 });
+
+  /* The pool does not grow with the request count. */
+  assert.equal(four.memory.kvTokens, 262144);
+  assert.equal(four.memory.kvBytes, one.memory.kvBytes);
+  /* What grows is the state it really allocates: 1.26 GB a request. */
+  assert.equal(
+    Math.round((four.memory.requiredBytes - one.memory.requiredBytes) / 1e8),
+    Math.round((1.26 * 3 * GB) / 1e8),
+  );
+  /* And the trade is stated rather than hidden. */
+  assert.match(four.warnings.find((w) => w.code === 'shared-pool').message, /HTTP 400/);
+  assert.equal(one.warnings.some((w) => w.code === 'shared-pool'), false);
+});
+
+/* vLLM keeps the stricter rule: its bundled figures were measured against it. */
+test('a per-sequence pool still pays for every request at full length', () => {
+  const four = planOf(fixture(), roomyNode(), [], { contextLength: 32768, maxRequests: 4 });
+
+  assert.equal(four.memory.kvTokens, 32768 * 4);
+  assert.equal(four.warnings.some((w) => w.code === 'shared-pool'), false);
+});
+
+/*
+ * When the settings need more than the ceiling the fraction is the clamp, not a
+ * figure that covers them - and a plausible 0.97 beside a memory blocker reads
+ * as a recommendation, which is the one thing it must not.
+ */
+test('an unattainable fraction says it is the ceiling', () => {
+  /* One full-length request of a context this box cannot hold. */
+  const small = roomyNode({ memory: { total: 40 * GB, used: 0, available: 40 * GB } });
+  const entry = planOf(sglang(), small, [], { contextLength: 262144, maxRequests: 1 });
+
+  assert.equal(entry.fits, false);
+  assert.equal(entry.tuning.clamped, true);
+  assert.equal(entry.tuning.minUtilization, 0.97);
+  assert.ok(entry.blockers.some((b) => b.code === 'memory'));
+
+  /* A shape that does fit is not flagged. */
+  assert.equal(planOf(sglang(), roomyNode(), [], { contextLength: 8192, maxRequests: 1 }).tuning.clamped, false);
+});

@@ -289,6 +289,9 @@ export interface RecipePlan {
     /* The flag the fraction is passed as: --gpu-memory-utilization on vLLM,
      * --mem-fraction-static on SGLang. */
     memoryFlag: string;
+    /* True when these settings need more than the fraction's ceiling, so the
+     * figure above is the clamp and a memory blocker sits beside it. */
+    clamped: boolean;
     /* False once the user has pinned a fraction of their own. */
     automatic: boolean;
     contextOptions: number[];

@@ -112,6 +112,12 @@ export const ENGINES = {
     draftRevisionFlag: null,
     memoryCoversOverhead: true,
     memoryFractionOf: 'total',
+    /*
+     * vLLM will not start unless its pool holds max-model-len, and the bundled
+     * recipes are priced so every concurrent request can hold the full context
+     * at once. Kept as it was: those figures were measured against that rule.
+     */
+    kvPoolShared: false,
     /* vLLM sizes its mamba cache from max-num-seqs alone. */
     statePaddingSlots: 0,
     /* The image serves 0.0.0.0:8000 without being told to. */
@@ -140,6 +146,20 @@ export const ENGINES = {
     draftRevisionFlag: '--speculative-draft-model-revision',
     memoryCoversOverhead: false,
     memoryFractionOf: 'free',
+    /*
+     * SGLang serves every request out of ONE pool and treats
+     * --max-running-requests as an admission limit rather than an allocation:
+     * the pool is whatever the fraction buys, and a request whose input exceeds
+     * it is refused with HTTP 400 instead of the server failing to start. So
+     * the pool is priced for one full-length request, and the request count
+     * costs only the state it really allocates.
+     *
+     * Pricing it the other way made configurations impossible that the upstream
+     * recipe runs daily: its own 4-request profile holds a 413,460-token pool -
+     * 1.6 full-length requests, not 4 - and its 16-request profile 238,605.
+     * Raise the fraction by hand to buy a pool that holds more than one.
+     */
+    kvPoolShared: true,
     /*
      * SGLang allocates one slot more than the requests it was asked for - "the
      * pool's padding slot is allocated alongside the request slots", in its own
@@ -820,7 +840,13 @@ export function sizeFor(recipe, tuning) {
   }
 
   const weightsBytes = recipe.memory.weightsBytes + recipe.memory.draftBytes;
-  const kvTokens = tuning.contextLength * tuning.maxRequests;
+  /*
+   * How many tokens of pool the settings require. An engine with a shared pool
+   * needs one full-length request's worth to serve at all; one that reserves
+   * per sequence needs every request's worth at once. See the ENGINES rows.
+   */
+  const kvTokens =
+    tuning.contextLength * (ENGINES[recipe.runtime]?.kvPoolShared ? 1 : tuning.maxRequests);
   const kvBytes = kvTokens * recipe.memory.kvBytesPerToken;
   /* Per sequence, not per token: the recurrent state of a hybrid model's linear
    * layers, which is the same size whether the sequence is 1 token or 260k -
@@ -880,10 +906,19 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
    * A service reserves nothing up front - it allocates as it works - so there
    * is no fraction to compute and its declared figure is the whole story.
    */
+  const wantedUtilization = engine && fractionBasisBytes ? ceil2(fractionBytes / fractionBasisBytes) : null;
   const minUtilization =
-    engine && fractionBasisBytes
-      ? Math.min(MAX_UTILIZATION, Math.max(MIN_UTILIZATION, ceil2(fractionBytes / fractionBasisBytes)))
-      : null;
+    wantedUtilization === null
+      ? null
+      : Math.min(MAX_UTILIZATION, Math.max(MIN_UTILIZATION, wantedUtilization));
+
+  /*
+   * True when these settings need MORE than the ceiling, so the fraction below
+   * is the clamp rather than a figure that covers them. The panel has to say so:
+   * a plausible-looking 0.97 beside a memory blocker reads as a recommendation,
+   * and the whole point of computing the fraction is that it is never that.
+   */
+  const utilizationClamped = wantedUtilization !== null && wantedUtilization > MAX_UTILIZATION;
 
   /* An override buys a deeper prefix cache; below the minimum the KV pool can
    * no longer hold one full-length request and the engine refuses to start. */
@@ -1067,6 +1102,19 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
       message: `the ${round(weightsBytes)} GB weight figure is estimated from the parameter count, not measured`,
     });
   }
+  /*
+   * The honest cost of pricing a shared pool for one request: the concurrency
+   * is admitted, but the pool is not sized for every slot to be full-length.
+   */
+  if (engine?.kvPoolShared && tuning.maxRequests > 1) {
+    warnings.push({
+      code: 'shared-pool',
+      message:
+        `the pool is sized to hold one full-length request; ${tuning.maxRequests} requests share it, ` +
+        `and an input longer than the pool is refused with HTTP 400 - raise the memory fraction to ` +
+        `buy a deeper one`,
+    });
+  }
   if (engine && recipe.memory.statePerRequestBytes > 0 && !recipe.memory.stateMeasured) {
     warnings.push({
       code: 'state-estimate',
@@ -1109,6 +1157,9 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
       minUtilization,
       /* The flag this fraction is passed as, which differs per engine. */
       memoryFlag: engine.memoryFlag,
+      /* When true, the fraction above is the ceiling and does not cover the
+       * settings - there will be a memory blocker beside it. */
+      clamped: utilizationClamped,
       /* False once the user has pinned a fraction of their own. */
       automatic: tuning.override === null,
       contextOptions: contextOptions(recipe),

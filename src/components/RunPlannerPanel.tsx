@@ -377,6 +377,9 @@ function RecipeDetail({
   const knobs = plan.tuning;
   const minUtilization = knobs?.minUtilization ?? null;
   const automatic = knobs?.automatic ?? true;
+  /* The settings need more than the ceiling, so the fraction is not a setting
+   * that covers them - it is as far as the control goes. */
+  const clamped = knobs?.clamped ?? false;
   const utilization = knobs?.gpuMemoryUtilization ?? null;
   const contextLength = tuning.contextLength ?? knobs?.contextLength ?? 0;
   const maxRequests = tuning.maxRequests ?? knobs?.maxRequests ?? 0;
@@ -431,7 +434,11 @@ function RecipeDetail({
           value={utilization ?? minUtilization ?? 0}
           options={utilizationSteps}
           format={(value) =>
-            automatic || value === minUtilization ? `${value} · minimum` : String(value)
+            clamped && value === minUtilization
+              ? `${value} · ceiling, not enough`
+              : automatic || value === minUtilization
+                ? `${value} · minimum`
+                : String(value)
           }
           /* The first step IS the computed minimum, so sliding fully left hands
            * the fraction back to the planner instead of pinning today's number. */
@@ -466,7 +473,9 @@ function RecipeDetail({
             )}
             <Fact
               label="Reserves"
-              value={`${bytes(plan.memory.claimBytes)}${automatic ? ' (minimum)' : ` (${utilization})`}`}
+              value={`${bytes(plan.memory.claimBytes)}${
+                clamped ? ' (ceiling)' : automatic ? ' (minimum)' : ` (${utilization})`
+              }`}
             />
           </>
         ) : (
