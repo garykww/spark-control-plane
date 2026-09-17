@@ -1366,3 +1366,255 @@
       Unlike the pinned vLLM the upstream recipe assumes, no transformers
       install is needed: v0.28.0 already pins transformers >= 5.5.3 and knows
       GlmAsrForConditionalGeneration.
+
+# ---------------------------------------------------------------------------
+# Ported from github.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2 (MIT), the
+# SGLang recipe @redp314 measured on a Spark over the weekend of 2026-09-02.
+# It serves the SAME model as the first recipe in this file on a DIFFERENT
+# engine, and that is the whole point of it: the vLLM recipe above gets 45.6
+# tok/s single-stream on code, this one is published at 64-78 to 65k of
+# context, because SGLang takes the drafter at a budget of 16 where vLLM's
+# DFlash2 path caps at 7.
+#
+# WHAT CARRIED OVER VERIFIED, on nv-spark-01, 2026-09-17:
+#
+#   the base image      lmsysorg/sglang:qwen38-27b is already on this node, and
+#                       its aarch64 manifest IS their pinned digest
+#                       3c0abdf4 - same config id - so the overlay build below
+#                       re-pulls nothing.
+#   the overlay         the six patched runtime files fetch and land byte-for-
+#                       byte on the sizes their repo publishes (197,724 bytes
+#                       in total). Build took 7 s on top of the cached base.
+#   both checkpoints    fetched at the pinned revisions: 21,945,296,505 bytes
+#                       for the target, 1,550,171,530 for the drafter.
+#   the model shape     config.json of this export: 64 layers, of which
+#                       layer_types marks 16 full_attention and 48 linear
+#                       (full_attention_interval 4); num_key_value_heads 4,
+#                       head_dim 256, max_position_embeddings 262144.
+#   the readiness probe SGLang's own middleware exempts /health and
+#                       /health_generate from --api-key (http_server.py), and
+#                       /health_generate runs a real generation - so it answers
+#                       only when the scheduler can serve, which /v1/models
+#                       does not. The launcher probes it without a key.
+#
+# WHAT THE BOOTS SETTLED, and the reason this recipe took an engine change
+# rather than a YAML entry. SGLang's mem-fraction-static is a fraction of FREE
+# memory, not of total, which vLLM's is not - three boots beside a resident
+# vLLM server, one request and 262,144 context:
+#
+#   0.45 -> max_total_num_tokens 16,633     0.55 -> 81,558    0.65 -> 142,477
+#
+# `fraction x free - weights` predicts all three within 5%. The planner now
+# sizes this engine against free memory for exactly that reason, and the three
+# figures below are read off those logs rather than derived.
+#
+# The first attempt at 0.33 - what the planner computed while treating the
+# fraction as vLLM's - did not start at all:
+#
+#   RuntimeError: Not enough GPU memory for hybrid (mamba/linear-attention)
+#   state cache. Computed max_mamba_cache_size=-14 (total_rest_memory=-0.97 GB,
+#   mamba_cache_per_req=74.81 MB)
+#
+# which is the failure this planner exists to catch before a weight load.
+#
+# WHAT DID NOT CARRY OVER from their serve.sh, and why:
+#
+#   MEM_FRACTION=0.65   Computed, not declared - see the header. Their 0.65
+#                       pairs with MAX_RUNNING=4 and a pool of 413,460 tokens,
+#                       which is NOT four full-length requests. This planner
+#                       sizes for the context and concurrency actually asked
+#                       for, so it will ask for more than 0.65 at four
+#                       requests and much less at one.
+#   HF_HUB_OFFLINE=1    Their script never downloads; this one has just
+#                       downloaded, and leaving the Hub reachable is what lets
+#                       a missing file be fetched rather than crash-loop. The
+#                       refs/main their README is about is written by the run
+#                       itself - see planner.js, engineDownloads.
+#   DRAFT_WINDOW        Refused there, absent here: the flag parses, boots, and
+#                       then kills the scheduler on the first batch.
+#   the tactic cache    MOUNTED (see volumes) but NOT populated. Their kept
+#                       FlashInfer draws are worth +16% on fresh decode and are
+#                       in their data/tactic-cache/; installing them has to go
+#                       through a container because the mounted tree is
+#                       root-owned, which is a step this recipe cannot express.
+#                       Until then the first boot autotunes into the empty
+#                       mount and keeps whatever it drew - one boot in three is
+#                       a good draw, by their measurement.
+#   CPUSET=5-9,15-19    The launcher already pins exactly these cores on a
+#                       dgx-spark node, so the recipe says nothing about it.
+
+- id: qwen38-27b-sglang-dflash2
+  runtime: sglang
+  name: Qwen3.8-27B · SGLang + DFlash2
+  summary: >-
+    The same weights as the vLLM recipe on SGLang, which takes the drafter at a
+    budget of 16 rather than 7. Published at 64-78 tok/s on code to 65k.
+  model:
+    # Measured: `du -sb` on this node's cache, 2026-09-17. Their README says
+    # 21 GB; this is the export's real on-disk size.
+    repo: RadixArk/Qwen3.8-27B-NVFP4
+    sizeGB: 21.9
+    measured: true
+    # The snapshot every number in their repo was measured on. Pinning it means
+    # the run writes refs/main for it, which is the trap their README opens with.
+    revision: 554ebba9b5f1b79dc11246341960360e6ef05ef4
+  draft:
+    # The NVFP4 drafter: 1.45 GB read per pass instead of 3.85 for the BF16 one
+    # the vLLM recipe uses, same acceptance, +5-10% generation by their
+    # measurement. `--speculative-draft-model-quantization` below is not
+    # optional - the checkpoint needs its scheme named.
+    repo: maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal
+    sizeGB: 1.55
+    measured: true
+    revision: bd7a934213c47a9e7ef69eef36bb3325f47fd1f1
+  image:
+    # Local, and built here: the overlay is six patched SGLang files on top of
+    # the day-0 image, and nothing publishes the result.
+    ref: qwen38-27b-sglang-dflash2-sm121:0.3.0
+    build:
+      # Their pinned digest, which is the aarch64 manifest of
+      # lmsysorg/sglang:qwen38-27b - verified as the same image on this node,
+      # so this pulls nothing that a Spark running the tag does not already
+      # have.
+      from: lmsysorg/sglang@sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6
+      run:
+        # sgl-project/sglang PR #35371 (DFlash2: local convolution + candidate
+        # selector) plus #35496 (quantised target lm_head in the DFlash2
+        # selector). Without #35496 the selector is refused the draft CUDA
+        # graph on an NVFP4 target and throughput drops; the log line is
+        # "kept eager (reason=quantized lm_head)", and it is worth grepping for
+        # on the first boot.
+        #
+        # Fetched from their repo at one commit rather than vendored here:
+        # 200 KB of patched upstream Python does not belong in this tree, and a
+        # raw.githubusercontent URL carrying a commit sha is content-addressed.
+        # The six files land on the byte sizes that commit publishes - checked.
+        # curl is in the base image.
+        - curl -fsSL --create-dirs -o /sgl-workspace/sglang/python/sglang/kernels/ops/speculative/dflash.py https://raw.githubusercontent.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2/60639a9794c13ba8f988e0dd92fef77c68793d30/image/python/sglang/kernels/ops/speculative/dflash.py
+        - curl -fsSL --create-dirs -o /sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py https://raw.githubusercontent.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2/60639a9794c13ba8f988e0dd92fef77c68793d30/image/python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py
+        - curl -fsSL --create-dirs -o /sgl-workspace/sglang/python/sglang/srt/models/dflash.py https://raw.githubusercontent.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2/60639a9794c13ba8f988e0dd92fef77c68793d30/image/python/sglang/srt/models/dflash.py
+        - curl -fsSL --create-dirs -o /sgl-workspace/sglang/python/sglang/srt/speculative/dflash2_compat.py https://raw.githubusercontent.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2/60639a9794c13ba8f988e0dd92fef77c68793d30/image/python/sglang/srt/speculative/dflash2_compat.py
+        - curl -fsSL --create-dirs -o /sgl-workspace/sglang/python/sglang/srt/speculative/dflash_utils.py https://raw.githubusercontent.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2/60639a9794c13ba8f988e0dd92fef77c68793d30/image/python/sglang/srt/speculative/dflash_utils.py
+        - curl -fsSL --create-dirs -o /sgl-workspace/sglang/python/sglang/srt/speculative/dflash_worker_v2.py https://raw.githubusercontent.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2/60639a9794c13ba8f988e0dd92fef77c68793d30/image/python/sglang/srt/speculative/dflash_worker_v2.py
+  container: spark-run-qwen38-sglang-dflash2
+  # Their port, and not 8000: the vLLM recipe for this model publishes 8000, and
+  # a node can hold both containers at once.
+  port: 8003
+  volumes:
+    # FlashInfer autotunes at every boot and keeps the result in memory, so
+    # without this mount each boot re-times every kernel and lands somewhere
+    # else on the throughput distribution - a spread of about 20%, and the one
+    # non-obvious win in their whole repo. Mounted, autotuning stays ON and a
+    # good draw survives a restart.
+    - host: ~/sglang-cache
+      container: /root/.cache/sglang
+  # MEASURED on nv-spark-01, 2026-09-17, and outside the fraction: unlike
+  # vLLM's, SGLang's mem-fraction-static covers the weights and the pools, and
+  # activation and CUDA graph capture are taken from what is left afterwards.
+  # Off the boot logs, at one request and a draft budget of 16: 2.66 GB between
+  # "Memory pool end" and the end of graph capture, with the target's verify
+  # graph 0.14 GB of it and the draft's the rest. Rounded up to 4 GB, because
+  # graph capture grows with the request count and these boots were at one.
+  overheadGB: 4
+  # MEASURED, and it is the cost of a pool TOKEN rather than of KV alone.
+  #
+  # The KV part is exact and matches config.json: 16 full-attention layers x 2
+  # (K and V) x 4 kv heads x 256 head_dim x 2 bytes for bf16 = 65,536 bytes,
+  # and the drafter's own KV pool adds 20,514 more per token - the logs
+  # allocate both against the same token count ("KV Cache is allocated" twice,
+  # 8.70 GiB and 2.72 GiB over 142,477 tokens). That is 86,050 bytes.
+  #
+  # The rest is the mamba main-state slots, which SGLang funds out of the same
+  # leftover and grows alongside the pool: 9 slots at 0.45, 28 at 0.55, 48 at
+  # 0.65, 44 at 0.63. Taking each boot's KV bytes plus its main-state slots over
+  # its own pool gives 113.0, 113.9 and 113.3 KB per token on the three large
+  # pools (the 16,633-token boot pays 132.9, because the padding slot is a
+  # tenth of a pool that small).
+  #
+  # 114,000 rounds that up, deliberately: over-reserving shows up as surplus
+  # prefix cache in the panel, and under-reserving shows up as a server that
+  # boots with a pool too small for the context it was priced for. 110,000 was
+  # tried first and did exactly that - priced at 0.63 for 131,072 tokens, the
+  # boot came back with max_total_num_tokens=129,450, 1.2% short.
+  kvBytesPerToken: 114000
+  kvMeasured: true
+  # MEASURED: the intermediate SSM and conv reserve, which is what a REQUEST
+  # costs here rather than the 74.81 MB main state slot. SGLang sizes it as
+  # per_req x (requests + 1) x speculative-num-draft-tokens, so at a draft
+  # budget of 16 one request is 16 x 78.44 MB = 1.26 GB - and the +1 is the
+  # pool's padding slot, which the sglang engine row adds for every recipe.
+  #
+  # It is therefore a function of the DRAFT BUDGET as much as of the model: at
+  # --speculative-num-draft-tokens 8 it would halve. Re-measure if that moves.
+  stateGBPerRequest: 1.26
+  stateMeasured: true
+  args:
+    --trust-remote-code: true
+    --attention-backend: flashinfer
+    # bfloat16, not fp8: they measured fp8_e4m3 at +20-29% past 130k of context
+    # and -12-21% on prefill, and did not adopt it.
+    --kv-cache-dtype: bfloat16
+    --mamba-ssm-dtype: bfloat16
+    # Keeps spare recurrent-state buffers so the radix cache can serve a prefix
+    # of a finished sequence. It is what stateGBPerRequest above is paying for.
+    --mamba-radix-cache-strategy: extra_buffer
+    --page-size: 1
+    --mamba-full-memory-ratio: 11.93
+    --chunked-prefill-size: 2048
+    # The model's native window, and the ceiling the panel offers.
+    --context-length: 262144
+    # One, like the vLLM recipe: this configuration wins on single-stream
+    # latency. Their own figures scale well past it - 360 tok/s aggregate at 16
+    # streams - but a sixteenth slot costs both pool and recurrent state, so
+    # raise it in the panel and watch the estimate rather than shipping it.
+    --max-running-requests: 1
+    --speculative-algorithm: DFLASH
+    # The drafter is declared above for planning and named here for the engine.
+    # The two must agree; nothing checks it, exactly as with the vLLM recipe's
+    # --speculative-config.
+    --speculative-draft-model-path: maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal
+    --speculative-draft-model-quantization: modelopt_fp4
+    --speculative-draft-attention-backend: flashinfer
+    # 16, not the 8 the DFlash2 blog uses and not the 7 the vLLM recipe is
+    # capped at. The drafter's block_size of 8 is not a cap on the verify
+    # budget: they measured 8 -> 16 as +69.3% on edit-heavy work and +10.5% on
+    # fresh code, and 24 as past the knee on both.
+    --speculative-num-draft-tokens: 16
+    --reasoning-parser: qwen3
+    --tool-call-parser: qwen3_coder
+    # Thinking off by default, which is what every number in their repo was
+    # measured with. Turn it on per request with chat_template_kwargs. Note
+    # what is NOT set here: preserve_thinking. The checkpoint's own template
+    # treats it as true when unset, and forcing it false strips prior turns'
+    # reasoning on every later turn, which costs accuracy and output tokens on
+    # multi-turn agent work.
+    --default-chat-template-kwargs: '{"enable_thinking": false}'
+    --enable-metrics: true
+    # Inherited from their script and untested either way under DFlash2, where
+    # the drafter does real work during prefill and a graph may now pay.
+    --disable-prefill-cuda-graph: true
+  notes:
+    - >-
+      Wins on single-stream latency and on long context: published at 64-78
+      tok/s to 65k, 56 at 130k and 38-41 at 260k, with 6.8-8.3 tokens accepted
+      per verify pass of a budget of 16.
+    - >-
+      Those figures are a CODING workload. On chat prompts the same server does
+      about 30 tok/s, because the block drafter accepts about 3 tokens per pass
+      on prose against 7-9 on code. Every published drafter for this model
+      behaves that way and a smaller budget does not help.
+    - >-
+      The FlashInfer tactic cache is mounted but empty, so the first boot
+      autotunes and keeps whatever draw it gets. Their kept draws are worth
+      +16% on fresh decode; installing them means copying two JSON files into
+      ~/sglang-cache THROUGH a container, because the mounted tree is
+      root-owned and a host-side cp fails silently.
+    - >-
+      Check the first boot's log for "kept eager (reason=quantized lm_head)".
+      That line means the image is missing PR #35496 and the selector is
+      running outside the draft CUDA graph, which costs throughput.
+    - >-
+      SGLang sizes its pools out of FREE memory, so what this recipe can hold
+      depends on what else is resident: the same fraction that fills an idle
+      Spark left a 16,633-token pool beside a running vLLM server. The panel
+      prices it against free memory for that reason.

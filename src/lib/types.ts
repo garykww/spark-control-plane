@@ -223,12 +223,13 @@ export type RunStatus =
 
 /* A whole serving configuration - weights, image and every flag - rather than a
  * template with blanks. Served once per connection; it never changes at runtime. */
-export type RecipeRuntime = 'vllm' | 'service';
+export type RecipeRuntime = 'vllm' | 'sglang' | 'service';
 
 export interface Recipe {
   id: string;
-  /* 'vllm' has weights, serving flags and a KV cache to size; 'service' is a
-   * container that brings its own entrypoint and declares a flat figure. */
+  /* 'vllm' and 'sglang' have weights, serving flags and a KV cache to size;
+   * 'service' is a container that brings its own entrypoint and declares a flat
+   * figure. */
   runtime: RecipeRuntime;
   name: string;
   summary: string;
@@ -239,10 +240,13 @@ export interface Recipe {
   port: number;
   containerName: string;
   /* Read back out of the recipe's own flags; null when it left the choice to
-   * vLLM by not setting --max-model-len / --max-num-seqs. */
+   * the engine by not setting them. */
   contextLength: number | null;
   concurrency: number | null;
   weightsBytes: number;
+  /* How this engine spells the tuned flags, for the argv preview. Null for a
+   * service, which takes no serving flags at all. */
+  flags: { context: string; requests: string; memory: string } | null;
   args: string[];
   notes: string[];
 }
@@ -265,6 +269,9 @@ export interface RecipePlan {
     /* The term that moves with the tuning below. */
     kvBytes: number;
     kvTokens: number;
+    /* Recurrent state, which costs per REQUEST rather than per token. Zero for
+     * everything but a hybrid model served by an engine that pools it. */
+    stateBytes: number;
     requiredBytes: number;
     /* What vLLM will actually ask for: its utilisation fraction of total. */
     claimBytes: number | null;
@@ -279,6 +286,9 @@ export interface RecipePlan {
     gpuMemoryUtilization: number | null;
     /* The smallest fraction that still covers the settings above. */
     minUtilization: number | null;
+    /* The flag the fraction is passed as: --gpu-memory-utilization on vLLM,
+     * --mem-fraction-static on SGLang. */
+    memoryFlag: string;
     /* False once the user has pinned a fraction of their own. */
     automatic: boolean;
     contextOptions: number[];

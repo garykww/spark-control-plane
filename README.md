@@ -293,17 +293,28 @@ The node detail page lists a set of **recipes** — whole serving configurations
 
 ![picking a recipe and pricing it against the node's free memory](docs/model-runs.png)
 
-The catalogue ships five — four ported from a reference launcher, one built from the model's own config:
+The catalogue ships eight, across three runtimes — `vllm`, `sglang` and `service`:
 
 | Recipe | From | Figures |
 | --- | --- | --- |
 | **Qwen3.8-27B · NVFP4 + DFlash2** | `serve-qwen38-27b-vllm-tuned.sh` | Measured end to end on real hardware |
+| **Qwen3.8-27B · SGLang + DFlash2** | [pangoleen/qwen3.8-27b-dgx-spark-dflash2](https://github.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2) | The same weights on the other engine, at a draft budget of 16 rather than 7. Memory measured across four boots on a Spark; the published throughput figures are theirs |
 | **Qwen3.6-35B-A3B · NVFP4 + DFlash** | `serve-qwen36-35b-a3b-dflash.sh` | Weights measured on the node, KV derived from its `config.json`; the overhead figure is an estimate, and the panel labels it |
 | **DiffusionGemma-26B-A4B · NVFP4** | `serve-diffusiongemma-26b-a4b.sh` | Measured, off a real startup log for this model on the node |
-| **ComfyUI · MiniMax H3** | `run-comfyui-h3-spark.sh` | Measured on a GB10; a `service` recipe, so no KV cache and nothing to tune |
-| **Qwen3-ASR-1.7B · BF16** | [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) | Weights measured off the Hub, KV derived from `config.json`, overhead estimated; the only recipe that *builds* its image |
+| **ComfyUI · MiniMax H3**, and a SageAttention variant | `run-comfyui-h3-spark.sh` | Measured on a GB10; `service` recipes, so no KV cache and nothing to tune |
+| **Qwen3-ASR-1.7B · BF16** | [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) | Weights measured off the Hub, KV derived from `config.json`, overhead estimated; builds its image |
+| **GLM-ASR-Nano-2512 · BF16** | the model card | Weights measured off the Hub, KV derived from `config.json` |
 
 Add your own by appending to the list.
+
+**Three runtimes, and what each one means.** `vllm` and `sglang` are inference engines: weights from the Hub, serving flags, and a KV cache whose size is the whole planning question. `service` is a container that brings its own entrypoint, declares one memory figure and has nothing to tune — ComfyUI is that kind.
+
+The two engines are planned with the same arithmetic over a different vocabulary (`--max-model-len` against `--context-length`, `--max-num-seqs` against `--max-running-requests`), which lives in one table in `server/recipes.js` rather than in branches. Two of the differences are not vocabulary, and both were measured rather than read off documentation:
+
+- **vLLM's fraction is of total memory; SGLang's is of what is free when it starts.** On an idle box those are nearly the same number. Beside a resident server they are not: the same `0.65` that fills an empty Spark left a 16,633-token pool next to a running vLLM server. Three boots at one request and 262,144 context — `0.45 → 16,633`, `0.55 → 81,558`, `0.65 → 142,477` — are predicted by `fraction × free − weights` to within 5%, and pricing SGLang against *total* produced a fraction that did not start at all.
+- **vLLM's block covers everything it will allocate; SGLang's covers the weights and the pools only**, with activation and CUDA graph capture taken from what is left afterwards.
+
+A hybrid model adds a third term the planner carries for both: the Gated DeltaNet layers keep a fixed-size recurrent state per *sequence*, so raising the request count costs more than KV pool. vLLM folds it into its KV page under `--mamba-cache-mode align`; SGLang pools it separately, and at a draft budget of 16 it is 1.26 GB per request — with one more slot than requests, because the pool allocates a padding slot beside them.
 
 **Why whole recipes and not dropdowns.** The tuning is interdependent: DFlash2 needs a target with an unquantised `lm_head`, GDN layers only work under one specific mamba cache mode, and FP8 KV needs calibration scales the NVFP4 exports ship and the FP8 export doesn't. A screen of independent dropdowns would mostly produce combinations that fail at load, several minutes into a weight load.
 
@@ -321,6 +332,8 @@ Add your own by appending to the list.
     repo: incoai/Qwen3.8-27B-DFlash2
     sizeGB: 3.8
     measured: true
+    # revision: <sha>        # optional; pins the snapshot, and the run then
+    #                        # writes the refs/main a sha-only download omits
   image:
     ref: vllm/vllm-openai:v0.28.0-aarch64
   container: spark-run-qwen38-nvfp4-dflash2
@@ -328,7 +341,9 @@ Add your own by appending to the list.
   overheadGB: 8.2           # non-torch + activation + CUDA graphs, measured
   kvBytesPerToken: 44827    # measured; sizes the pool from the settings below
   kvMeasured: true          # false labels the estimate in the panel
-  args:                     # vLLM flags; a bare flag is `true`, `false` omits it
+  # stateGBPerRequest: 1.26 # recurrent state per sequence, for a hybrid model
+  #                         # whose engine pools it separately (see runtimes)
+  args:                     # engine flags; a bare flag is `true`, `false` omits it
     --max-model-len: 262144 # a DEFAULT — the panel lets you change it per run
     --max-num-seqs: 1       # likewise
     --kv-cache-dtype: fp8
@@ -338,13 +353,13 @@ Add your own by appending to the list.
     - Shown under the recipe in the panel.
 ```
 
-The model id is passed positionally and served under its own name, so it isn't repeated in `args`. `--max-model-len` and `--max-num-seqs` are read back out of the flags rather than declared twice, and act as the panel's starting values. Do **not** set `--gpu-memory-utilization` — the planner computes it, and a recipe that pins it is refused on load. Values containing `{ } " :` must be quoted or YAML reads them as structure.
+The model id is passed positionally (`--model-path` on SGLang) and served under its own name, so it isn't repeated in `args`. The context and request flags are read back out of the flags rather than declared twice, and act as the panel's starting values. Do **not** set the memory fraction — `--gpu-memory-utilization` on vLLM, `--mem-fraction-static` on SGLang — the planner computes it, and a recipe that pins it is refused on load. A `runtime: sglang` recipe is otherwise written exactly like a vLLM one; the shipped Qwen3.8-27B pair is the same model on both engines, and reading them side by side is the fastest way to see what changes. Values containing `{ } " :` must be quoted or YAML reads them as structure.
 
 Every recipe is validated on load — ids, image references, container names, and every flag and value that will be interpolated into a command on the node. A bad recipe refuses the *whole* catalogue rather than being quietly dropped, and the reason appears both in the server log and in the panel itself. A broken recipe file never stops the dashboard from monitoring.
 
 **Context and concurrency are yours to set.** Each recipe ships defaults, and the panel lets you change the context length and the maximum number of concurrent requests before you run it. The memory estimate re-prices as you do — the panel posts the settings to the server and renders what comes back, so the figure on screen is by construction the one the launch route enforces rather than a second implementation of the same arithmetic.
 
-**`--gpu-memory-utilization` is computed, not fixed.** This is the part worth understanding, because vLLM's fraction is a policy rather than a requirement:
+**The memory fraction is computed, not fixed.** This is the part worth understanding, because the engine's fraction is a policy rather than a requirement:
 
 > vLLM claims `utilization × total` memory as one block at startup, loads the weights into it, and gives the entire remainder to the KV cache — which is never resized afterwards. Measured on a Spark running the NVFP4 + DFlash2 recipe at `0.92`: 28.16 GiB weights and non-torch, 3.07 GiB peak activation, 1.81 GiB CUDA graphs, and **80.73 GiB of KV cache** — 71% of the reservation. That bought 1,933,714 tokens of pool, or 7.38 concurrent full-length requests, at `--max-num-seqs 1`.
 
