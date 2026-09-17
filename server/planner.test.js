@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
+  apiKeyFor,
   assertRunId,
   buildRunScript,
   buildRunMeta,
@@ -137,7 +138,7 @@ test('the script walks the phases in order and only ever exits 0 from ready', ()
  */
 test('the container is launched with a pinned entrypoint and an explicit serve', () => {
   const script = scriptFor(KEPT);
-  assert.match(script, /--entrypoint vllm \\\n {2}'vllm\/vllm-openai:v0\.28\.0-aarch64' serve/);
+  assert.match(script, /--entrypoint 'vllm' \\\n {2}'vllm\/vllm-openai:v0\.28\.0-aarch64' 'serve'/);
 });
 
 test('a drafted recipe fetches both the target and its drafter', () => {
@@ -431,4 +432,83 @@ test('a declared command replaces the image CMD, and a recipe without one adds n
   const vllm = recipeById(KEPT);
   assert.deepEqual(vllm.command, []);
   assert.equal(scriptFor(KEPT).includes("' --listen '"), false);
+});
+
+/*
+ * SGLang launches differently in three ways that a quoting test would not
+ * catch: the image's own entrypoint is kept, the bind address and port have to
+ * be passed as flags, and a pinned revision needs a refs/main the download does
+ * not write.
+ */
+const SGLANG_RUN = 'qwen38-27b-sglang-dflash2';
+
+test('an sglang recipe goes through the image entrypoint rather than replacing it', () => {
+  const script = scriptFor(SGLANG_RUN);
+
+  assert.equal(script.includes('--entrypoint'), false);
+  assert.match(script, /'qwen38-27b-sglang-dflash2-sm121:0\.3\.0' 'sglang' 'serve'/);
+  assert.doesNotThrow(() => execFileSync('sh', ['-n'], { input: script }));
+});
+
+/* SGLang binds loopback inside the container unless told otherwise, which
+ * publishes a port that answers nothing. */
+test('an sglang container is told to bind every interface, on its own port', () => {
+  const script = scriptFor(SGLANG_RUN);
+  assert.ok(script.includes(`'--host' '0.0.0.0' '--port' '8003'`));
+});
+
+/*
+ * `hf download --revision <sha>` writes no refs/ directory at all, and SGLang's
+ * speculative-algorithm alias resolver reads the draft config without a
+ * revision - so a pinned recipe crash-loops after a several-minute weight load.
+ * Confirmed on a Spark: after the pinned download the repo had no refs/ at all.
+ */
+test('a pinned recipe writes the refs/main its own loader will look for', () => {
+  const script = scriptFor(SGLANG_RUN);
+
+  assert.match(script, /--revision '554ebba9b5f1b79dc11246341960360e6ef05ef4'/);
+  assert.match(script, /refs\/main/);
+  /* Only when absent: an existing refs/main belongs to whoever wrote it. */
+  assert.match(script, /if \[ ! -f "\$HUB\/models--RadixArk--Qwen3\.8-27B-NVFP4"\/refs\/main \]/);
+  /* And only at a snapshot that actually holds weights. */
+  assert.match(script, /\*\.safetensors 2>\/dev\/null/);
+  /* The unpinned recipes are untouched by any of this. */
+  assert.match(scriptFor(KEPT), /: no pinned revisions to record/);
+});
+
+/* The tactic cache. Without the mount every boot re-times every FlashInfer
+ * kernel, which is a ~20% spread on identical settings. */
+test('an sglang recipe mounts its declared caches', () => {
+  const script = scriptFor(SGLANG_RUN);
+
+  assert.match(script, /-v "\$HOME\/sglang-cache":'\/root\/\.cache\/sglang'/);
+  assert.match(script, /mkdir -p "\$HOME\/sglang-cache"/);
+  /* And the HuggingFace cache, like any engine. */
+  assert.ok(script.includes('-v "$HF_CACHE:/root/.cache/huggingface"'));
+});
+
+/*
+ * SGLang exempts its health endpoints from --api-key, so the probe carries no
+ * key while everything a client can call still needs one. Checked on a Spark:
+ * /health_generate 200 without a key, /v1/models 401.
+ */
+test('an sglang server is keyed even though its probe is not', () => {
+  /* Published on the recipe's own port here, so the probe URL is the one a
+   * real run of it would use. */
+  const script = scriptFor(SGLANG_RUN, { port: 8003 });
+
+  assert.ok(script.includes(`'--api-key' '${API_KEY}'`));
+  assert.match(script, /"http:\/\/127\.0\.0\.1:8003\/health_generate"/);
+  assert.equal(script.includes(`Authorization: Bearer ${API_KEY}`), false);
+  assert.equal(apiKeyFor(recipeById(SGLANG_RUN)) === null, false);
+});
+
+test('a recipe that builds its image writes a Dockerfile rather than pulling', () => {
+  const script = scriptFor(SGLANG_RUN);
+
+  assert.match(script, /docker build -t 'qwen38-27b-sglang-dflash2-sm121:0\.3\.0'/);
+  /* The base is pinned by digest, and it is the aarch64 manifest of the tag the
+   * node already has - so this builds on cached layers rather than re-pulling. */
+  assert.match(script, /FROM lmsysorg\/sglang@sha256:3c0abdf4/);
+  assert.equal(script.includes('docker pull'), false);
 });

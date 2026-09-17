@@ -382,7 +382,7 @@ function RecipeDetail({
   const maxRequests = tuning.maxRequests ?? knobs?.maxRequests ?? 0;
 
   /*
-   * What vLLM reserves beyond what these settings actually need. In automatic
+   * What the engine reserves beyond what these settings actually need. In automatic
    * mode this is only the rounding step; an override makes it deliberate.
    */
   const surplus = Math.max(0, (plan.memory.claimBytes ?? 0) - plan.memory.requiredBytes);
@@ -393,7 +393,7 @@ function RecipeDetail({
   /*
    * The slider's steps: the computed minimum first, then round fractions above
    * it up to 0.95. Nothing below the minimum is offered at all - there the KV
-   * cache could not hold one full-length request and vLLM would refuse to
+   * cache could not hold one full-length request and the engine would refuse to
    * start, so it is a position the control simply does not have.
    */
   const utilizationSteps = [
@@ -459,6 +459,11 @@ function RecipeDetail({
               label="KV cache"
               value={`${bytes(plan.memory.kvBytes)} · ${formatTokens(plan.memory.kvTokens)} tokens`}
             />
+            {/* Per request, not per token, so it only moves with the request
+                slider - and only a hybrid model pays it at all. */}
+            {plan.memory.stateBytes > 0 && (
+              <Fact label="Recurrent state" value={`${bytes(plan.memory.stateBytes)} · ${maxRequests} req`} />
+            )}
             <Fact
               label="Reserves"
               value={`${bytes(plan.memory.claimBytes)}${automatic ? ' (minimum)' : ` (${utilization})`}`}
@@ -550,7 +555,7 @@ function RecipeDetail({
 
       {showFlags && (
         <pre className="mt-3 overflow-x-auto rounded-lg bg-surface-2 p-3 text-[11px] leading-relaxed text-ink-secondary">
-          {`vllm serve \\\n  ${tunedArgs(recipe, plan).join(' \\\n  ')}`}
+          {`${recipe.runtime === 'sglang' ? 'sglang' : 'vllm'} serve \\\n  ${tunedArgs(recipe, plan).join(' \\\n  ')}`}
         </pre>
       )}
     </div>
@@ -563,12 +568,13 @@ function RecipeDetail({
  * owns, then append the computed fraction.
  */
 function tunedArgs(recipe: Recipe, plan: RecipePlan): string[] {
-  const overrides: Record<string, string> = plan.tuning
-    ? {
-        '--max-model-len': String(plan.tuning.contextLength),
-        '--max-num-seqs': String(plan.tuning.maxRequests),
-      }
-    : {};
+  const overrides: Record<string, string> =
+    plan.tuning && recipe.flags
+      ? {
+          [recipe.flags.context]: String(plan.tuning.contextLength),
+          [recipe.flags.requests]: String(plan.tuning.maxRequests),
+        }
+      : {};
 
   const args: string[] = [];
   for (let i = 0; i < recipe.args.length; i += 1) {
@@ -584,7 +590,7 @@ function tunedArgs(recipe: Recipe, plan: RecipePlan): string[] {
   }
   for (const [flag, value] of Object.entries(overrides)) args.push(flag, value);
   if (plan.tuning?.gpuMemoryUtilization != null) {
-    args.push('--gpu-memory-utilization', String(plan.tuning.gpuMemoryUtilization));
+    args.push(plan.tuning.memoryFlag, String(plan.tuning.gpuMemoryUtilization));
   }
   return args;
 }
@@ -928,9 +934,9 @@ function ConfirmDialog({
             authentication of its own, so saying "an API key" would be wrong. */}
         <p className="mt-3 text-[11px] text-ink-muted">
           The server is published on port {recipe.port} of every interface,{' '}
-          {recipe.runtime === 'vllm'
-            ? `protected only by an API key — ${sharedApiKey ? 'the one stored in the vault' : 'one generated for this run'}`
-            : 'with no authentication in front of it'}
+          {recipe.runtime === 'service'
+            ? 'with no authentication in front of it'
+            : `protected only by an API key — ${sharedApiKey ? 'the one stored in the vault' : 'one generated for this run'}`}
           . The run continues on the node if you close this page.
         </p>
 

@@ -451,8 +451,8 @@ test('anything that could escape its quoting is refused by recipe id', () => {
 });
 
 test('a flag that is not a flag is refused', () => {
-  assert.throws(() => withArgs('  args:\n    "; rm -rf /": true\n'), /is not a valid vLLM flag/);
-  assert.throws(() => withArgs('  args:\n    max-model-len: 4096\n'), /is not a valid vLLM flag/);
+  assert.throws(() => withArgs('  args:\n    "; rm -rf /": true\n'), /is not a valid engine flag/);
+  assert.throws(() => withArgs('  args:\n    max-model-len: 4096\n'), /is not a valid engine flag/);
 });
 
 test('missing and malformed fields are reported by name', () => {
@@ -798,7 +798,7 @@ test('resolveArgs gives a service nothing, whatever it is handed', () => {
 
 test('vllm-only fields are refused on a service rather than silently ignored', () => {
   for (const field of ['overheadGB: 8', 'kvBytesPerToken: 44827']) {
-    assert.throws(() => service({ 'memoryGB: 40': `memoryGB: 40\n  ${field}` }), /belongs to a vllm recipe/);
+    assert.throws(() => service({ 'memoryGB: 40': `memoryGB: 40\n  ${field}` }), /belongs to an engine recipe/);
   }
 });
 
@@ -854,4 +854,154 @@ test('the shipped service recipe keeps its weights in the cache', () => {
   /* The turbo LoRAs are auto-fetched, but the loras/ directory is ALSO a
    * writable volume mount, for anything dropped in by hand. */
   assert.equal(comfy.volumes.some((v) => v.container.endsWith('/models/loras')), true);
+});
+
+/*
+ * SGLang. The same planning arithmetic as vLLM over a different vocabulary,
+ * plus two differences that are not vocabulary at all: its fraction is of FREE
+ * memory rather than total, and it allocates a state slot beside the ones asked
+ * for. Both were measured on a Spark - see the recipe's own comment.
+ */
+const SGLANG = `
+- id: sg
+  runtime: sglang
+  name: SGLang
+  summary: A recipe served by SGLang.
+  model:
+    repo: Qwen/Qwen3-8B
+    sizeGB: 16
+    measured: true
+    revision: 554ebba9b5f1b79dc11246341960360e6ef05ef4
+  draft:
+    repo: Qwen/Qwen3-8B-Draft
+    sizeGB: 2
+    measured: true
+    revision: bd7a934213c47a9e7ef69eef36bb3325f47fd1f1
+  image:
+    ref: sglang-local:0.3.0
+  container: spark-run-sg
+  port: 8003
+  overheadGB: 4
+  kvBytesPerToken: 114000
+  kvMeasured: true
+  stateGBPerRequest: 1.26
+  stateMeasured: true
+  args:
+    --context-length: 262144
+    --max-running-requests: 1
+    --trust-remote-code: true
+`;
+
+const sglang = (replacements = {}) => {
+  let yaml = SGLANG;
+  for (const [from, to] of Object.entries(replacements)) {
+    if (!yaml.includes(from)) throw new Error(`fixture has no "${from}" to replace`);
+    yaml = yaml.replace(from, to);
+  }
+  return parseRecipes(yaml)[0];
+};
+
+test('an sglang recipe names its model by flag and pins both revisions', () => {
+  const recipe = sglang();
+
+  assert.equal(recipe.runtime, 'sglang');
+  /* SGLang takes --model-path where vLLM takes the model positionally. */
+  assert.deepEqual(recipe.args.slice(0, 6), [
+    '--model-path',
+    'Qwen/Qwen3-8B',
+    '--revision',
+    '554ebba9b5f1b79dc11246341960360e6ef05ef4',
+    '--speculative-draft-model-revision',
+    'bd7a934213c47a9e7ef69eef36bb3325f47fd1f1',
+  ]);
+  /* Read back out of the engine's own spelling of the two tuned flags. */
+  assert.equal(recipe.contextLength, 262144);
+  assert.equal(recipe.concurrency, 1);
+  /* It listens on whatever --port says, so the recipe's port is the container's. */
+  assert.equal(recipe.containerPort, 8003);
+});
+
+/* A green /v1/models on a server whose scheduler is not up is the failure this
+ * project keeps rediscovering; /health_generate runs a real generation, and
+ * SGLang exempts it from the api key. Both checked on a Spark: 200 without a
+ * key against 401 on /v1/models. */
+test('an sglang recipe probes the endpoint that needs a live scheduler', () => {
+  assert.deepEqual(sglang().readiness, { path: '/health_generate', auth: 'none' });
+});
+
+test('each engine refuses the memory fraction under its own name', () => {
+  assert.throws(
+    () => sglang({ '    --trust-remote-code: true': '    --mem-fraction-static: 0.65' }),
+    /do not set --mem-fraction-static; the planner computes it/,
+  );
+  /* And the vLLM spelling is not what an sglang recipe is checked against. */
+  assert.doesNotThrow(() =>
+    sglang({ '    --trust-remote-code: true': '    --gpu-memory-utilization: 0.9' }),
+  );
+});
+
+test('a revision has to be a revision', () => {
+  assert.throws(
+    () => sglang({ '    revision: 554ebba9b5f1b79dc11246341960360e6ef05ef4': '    revision: "; rm -rf /"' }),
+    /is not a valid Hub revision/,
+  );
+});
+
+/*
+ * The difference that actually moves memory. vLLM's fraction is of total and
+ * SGLang's is of free, so beside a resident server the same settings price
+ * differently - and pricing SGLang against total is how a run boots with a pool
+ * a tenth of the size it was sold.
+ */
+test('sglang prices its fraction against free memory, vllm against total', () => {
+  /* Half the box is already spoken for. */
+  const busy = roomyNode({
+    memory: { total: SPARK_MEMORY, used: SPARK_MEMORY / 2, available: SPARK_MEMORY / 2 },
+  });
+
+  const sg = planOf(sglang(), busy, [], { contextLength: 8192, maxRequests: 1 });
+  const expected = (sg.memory.requiredBytes - sg.memory.overheadBytes) / (SPARK_MEMORY / 2);
+
+  assert.equal(sg.tuning.minUtilization, Math.ceil(expected * 100) / 100);
+  assert.equal(sg.tuning.memoryFlag, '--mem-fraction-static');
+
+  /* The same shape on vLLM divides by the whole box instead. */
+  const vllm = planOf(fixture(), busy, [], { contextLength: 8192, maxRequests: 1 });
+  assert.equal(vllm.tuning.minUtilization, Math.ceil((vllm.memory.requiredBytes / SPARK_MEMORY) * 100) / 100);
+  assert.equal(vllm.tuning.memoryFlag, '--gpu-memory-utilization');
+});
+
+/* Measured: SGLang's pool allocates "the padding slot alongside the request
+ * slots", and at a draft budget of 16 that spare slot is 1.26 GB rather than a
+ * rounding error. */
+test('sglang reserves recurrent state for one more request than asked for', () => {
+  const entry = planOf(sglang(), roomyNode(), [], { contextLength: 8192, maxRequests: 3 });
+
+  assert.equal(Math.round(entry.memory.stateBytes / 1e6), Math.round((1.26 * 4 * GB) / 1e6));
+  /* vLLM folds it into the KV page instead, so it carries none. */
+  assert.equal(planOf(fixture(), roomyNode()).memory.stateBytes, 0);
+});
+
+test('an sglang plan is tuned with sglang flag names', () => {
+  const recipe = sglang();
+  const args = resolveArgs(recipe, { contextLength: 65536, maxRequests: 2, gpuMemoryUtilization: 0.52 });
+
+  assert.equal(args[args.indexOf('--context-length') + 1], '65536');
+  assert.equal(args[args.indexOf('--max-running-requests') + 1], '2');
+  assert.equal(args[args.indexOf('--mem-fraction-static') + 1], '0.52');
+  assert.equal(args.includes('--gpu-memory-utilization'), false);
+});
+
+test('the shipped sglang recipe is the same model on the other engine', () => {
+  const sg = recipeById('qwen38-27b-sglang-dflash2');
+  const vllm = recipeById(KEPT);
+
+  assert.equal(sg.runtime, 'sglang');
+  /* Different port, so both can be resident at once. */
+  assert.notEqual(sg.port, vllm.port);
+  assert.notEqual(sg.containerName, vllm.containerName);
+  /* Its tactic cache is a declared volume: without the mount every boot
+   * re-times every FlashInfer kernel. */
+  assert.equal(sg.volumes.some((v) => v.container === '/root/.cache/sglang'), true);
+  assert.equal(sg.image.build?.run.length, 6);
 });

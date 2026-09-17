@@ -42,18 +42,130 @@ const GB = 1e9;
  */
 export const RECIPE_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 export const CONTAINER_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/;
-export const IMAGE_REF_RE = /^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?$/;
+export const IMAGE_REF_RE = /^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?(@sha256:[a-f0-9]{64})?$/;
 export const ARG_RE = /^[A-Za-z0-9 _.,:/@+={}"[\]-]{1,512}$/;
 export const FLAG_RE = /^--[a-z0-9][a-z0-9-]{0,63}$/;
+/* A Hub revision: a commit sha, or a branch or tag name. */
+export const REVISION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 /*
- * A recipe is either a vLLM serving configuration - weights, flags, a KV cache
- * whose size is the whole planning question - or a plain containerised service
- * that happens to want a GPU. ComfyUI is the second kind: no serving flags, no
- * KV cache, its own entrypoint, and weights that are files in a directory
- * rather than a repo in the HuggingFace cache.
+ * A recipe is either an inference-engine serving configuration - weights,
+ * flags, a KV cache whose size is the whole planning question - or a plain
+ * containerised service that happens to want a GPU. ComfyUI is the second kind:
+ * no serving flags, no KV cache, its own entrypoint, and weights that are files
+ * in a directory rather than a repo in the HuggingFace cache.
  */
-export const RUNTIMES = ['vllm', 'service'];
+export const RUNTIMES = ['vllm', 'sglang', 'service'];
+
+/*
+ * WHERE THE TWO ENGINES DIFFER, in one table.
+ *
+ * vLLM and SGLang serve the same models from the same HuggingFace cache and are
+ * planned with the same arithmetic, but they spell every knob differently and
+ * they do not mean the same thing by their memory fraction. Everything that
+ * follows reads the engine out of here rather than testing the runtime name, so
+ * adding a third engine is a row rather than a branch.
+ *
+ * TWO of these rows change the arithmetic rather than the spelling, and both
+ * were measured on nv-spark-01 rather than read off documentation:
+ *
+ * memoryCoversOverhead. vLLM claims `fraction x total` as ONE block and loads
+ * everything into it - weights, activation, graph capture and KV - so the
+ * fraction has to cover the lot. SGLang's mem-fraction-static covers the
+ * weights and the pools only; activation and CUDA graph capture are taken from
+ * what is left afterwards, so asking it for the overhead too would silently
+ * inflate the pool.
+ *
+ * memoryFractionOf. vLLM's fraction is of TOTAL memory, and it refuses to start
+ * when `fraction x total` exceeds what is free. SGLang's is of what is FREE
+ * when it starts, which is a different number on a shared box and the reason
+ * the same 0.65 that fills an idle Spark leaves a 16,633-token pool next to a
+ * resident vLLM server. Three boots on this node, weights 22.58 GiB, 60.05 GiB
+ * free at start, one request, 262,144 context:
+ *
+ *   fraction   pool after weights   max_total_num_tokens
+ *   0.45       4.35 GiB             16,633
+ *   0.55       10.94 GiB            81,558
+ *   0.65       17.28 GiB            142,477
+ *
+ * `fraction x free - weights` predicts those three pools to within 5%, and
+ * `fraction x total - weights` is not even the right sign at 0.45.
+ */
+export const ENGINES = {
+  vllm: {
+    /*
+     * Pinned deliberately, and the one thing that works against both image
+     * families: the spark-arena builds set no entrypoint, while
+     * vllm/vllm-openai already runs `vllm serve`, so passing `vllm serve ...`
+     * to the latter yields `vllm serve vllm serve ...` and argparse rejects it.
+     */
+    entrypoint: 'vllm',
+    command: ['serve'],
+    /* vLLM takes the model positionally: `vllm serve <repo id>`. */
+    modelFlag: null,
+    contextFlag: '--max-model-len',
+    requestsFlag: '--max-num-seqs',
+    memoryFlag: '--gpu-memory-utilization',
+    revisionFlag: '--revision',
+    /* vLLM carries the drafter's revision inside --speculative-config, so there
+     * is no separate flag to pass it as. */
+    draftRevisionFlag: null,
+    memoryCoversOverhead: true,
+    memoryFractionOf: 'total',
+    /* vLLM sizes its mamba cache from max-num-seqs alone. */
+    statePaddingSlots: 0,
+    /* The image serves 0.0.0.0:8000 without being told to. */
+    bindFlags: false,
+    containerPort: 8000,
+    /* An authenticated /v1/models answers only once the weights are loaded. */
+    readiness: { path: '/v1/models', auth: 'bearer' },
+    /* vLLM caches compiled kernels here and a warm cache is minutes off a boot. */
+    cacheVolume: { host: '$HOME/.cache/vllm', container: '/root/.cache/vllm' },
+  },
+  sglang: {
+    /*
+     * Not pinned, unlike vLLM: the image's entrypoint is NVIDIA's
+     * nvidia_entrypoint.sh, which prepares the container's GPU environment and
+     * then execs whatever it was given. Replacing it would skip that setup, so
+     * the command goes through it - which is also how the reference recipe this
+     * was ported from launches the same image.
+     */
+    entrypoint: null,
+    command: ['sglang', 'serve'],
+    modelFlag: '--model-path',
+    contextFlag: '--context-length',
+    requestsFlag: '--max-running-requests',
+    memoryFlag: '--mem-fraction-static',
+    revisionFlag: '--revision',
+    draftRevisionFlag: '--speculative-draft-model-revision',
+    memoryCoversOverhead: false,
+    memoryFractionOf: 'free',
+    /*
+     * SGLang allocates one slot more than the requests it was asked for - "the
+     * pool's padding slot is allocated alongside the request slots", in its own
+     * kv_cache_configurator - and the per-request state here is large enough
+     * that the spare one is worth 1.3 GB rather than a rounding error.
+     */
+    statePaddingSlots: 1,
+    /* SGLang binds 127.0.0.1 inside the container unless told otherwise, which
+     * publishes a port that answers nothing. */
+    bindFlags: true,
+    /* It listens on whatever --port says, so the launcher uses the recipe's. */
+    containerPort: null,
+    /*
+     * /v1/models answers before the scheduler is live - a green probe on a
+     * server that cannot yet serve is the failure this project keeps
+     * rediscovering. /health_generate runs a real generation, and SGLang's own
+     * api-key middleware exempts it, so the probe needs no key.
+     */
+    readiness: { path: '/health_generate', auth: 'none' },
+    /* FlashInfer's autotune draws. Mounted by the recipe rather than here,
+     * because keeping a good draw is a decision a recipe makes. */
+    cacheVolume: null,
+  },
+};
+
+export const isEngine = (runtime) => runtime in ENGINES;
 
 /* Host paths may use ~ for the node's home; the launcher expands it there. No
  * spaces, quotes or substitutions - these are interpolated into shell commands. */
@@ -96,8 +208,16 @@ function assertRepo(value, where) {
   return repo;
 }
 
-/* A model or drafter entry: which weights, how big, and whether that size was
- * measured or derived. The UI labels an estimate as one. */
+/*
+ * A model or drafter entry: which weights, how big, and whether that size was
+ * measured or derived. The UI labels an estimate as one.
+ *
+ * `revision` pins the snapshot. It is optional and usually left out - a recipe
+ * that names no revision follows the repo's main branch, which is what the
+ * bundled vLLM recipes do - but a recipe whose figures were measured on one
+ * particular export can say so, and then the run fetches and serves exactly
+ * that snapshot rather than whatever main has moved to since.
+ */
 function normaliseWeights(entry, where) {
   if (!entry || typeof entry !== 'object') throw new RecipeError(`${where} is required`);
 
@@ -106,10 +226,15 @@ function normaliseWeights(entry, where) {
     throw new RecipeError(`${where}.sizeGB must be a positive number of GB (got ${entry.sizeGB})`);
   }
 
+  const revision = entry.revision === undefined || entry.revision === null ? null : String(entry.revision);
+  if (revision !== null && !REVISION_RE.test(revision)) {
+    throw new RecipeError(`${where}.revision: "${revision}" is not a valid Hub revision`);
+  }
+
   return {
     repoId: assertRepo(entry.repo, `${where}.repo`),
     repoType: 'model',
-    revision: null,
+    revision,
     sizeBytes: sizeGB * GB,
     measured: entry.measured === true,
   };
@@ -121,16 +246,16 @@ function normaliseWeights(entry, where) {
  * contributes a flag and its value as two separate argv entries, so a value
  * containing a space stays one argument.
  */
-function normaliseArgs(raw, modelRepoId, servedName, where) {
+function normaliseArgs(raw, leading, servedName, where) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new RecipeError(`${where} must be a map of flag to value`);
   }
 
-  const args = [modelRepoId];
+  const args = [...leading];
   if (!('--served-model-name' in raw)) args.push('--served-model-name', servedName);
 
   for (const [flag, value] of Object.entries(raw)) {
-    if (!FLAG_RE.test(flag)) throw new RecipeError(`${where}: "${flag}" is not a valid vLLM flag`);
+    if (!FLAG_RE.test(flag)) throw new RecipeError(`${where}: "${flag}" is not a valid engine flag`);
     if (value === false || value === null || value === undefined) continue;
     if (value === true) {
       args.push(flag);
@@ -297,10 +422,11 @@ function normaliseCommand(entry, where) {
   });
 }
 
-/* How the run decides the service is actually up. vLLM answers an authenticated
- * /v1/models; everything else says where to look and whether to send the key. */
+/* How the run decides the server is actually up. Each engine brings a probe it
+ * is known to answer only when it can serve; everything else says where to look
+ * and whether to send the key. */
 function normaliseReadiness(entry, runtime, where) {
-  const fallback = runtime === 'vllm' ? { path: '/v1/models', auth: 'bearer' } : { path: '/', auth: 'none' };
+  const fallback = ENGINES[runtime]?.readiness ?? { path: '/', auth: 'none' };
   if (entry === undefined || entry === null) return fallback;
 
   const path = entry.path ?? fallback.path;
@@ -335,8 +461,9 @@ export function normaliseRecipe(entry, index) {
   }
 
   /* What the process listens on inside the container, which is rarely what it
-   * is published as. vLLM images serve 8000; ComfyUI serves 8188. */
-  const containerPort = Number(entry.containerPort ?? (runtime === 'vllm' ? 8000 : port));
+   * is published as. vLLM images serve 8000; ComfyUI serves 8188; SGLang serves
+   * whatever --port says, so it is given the recipe's own. */
+  const containerPort = Number(entry.containerPort ?? ENGINES[runtime]?.containerPort ?? port);
   if (!Number.isInteger(containerPort) || containerPort < 1 || containerPort > 65535) {
     throw new RecipeError(`${at}: containerPort must be between 1 and 65535 (got ${entry.containerPort})`);
   }
@@ -362,16 +489,17 @@ export function normaliseRecipe(entry, index) {
     notes: notes.map((note, i) => text(note, `${at}.notes[${i}]`)),
   };
 
-  return runtime === 'vllm'
-    ? normaliseVllmRecipe(entry, common, at)
+  return isEngine(runtime)
+    ? normaliseEngineRecipe(entry, common, at)
     : normaliseServiceRecipe(entry, common, at);
 }
 
 /*
- * A vLLM recipe: weights from the Hub, serving flags, and a KV cache whose size
- * is the thing the planner actually reasons about.
+ * An engine recipe: weights from the Hub, serving flags, and a KV cache whose
+ * size is the thing the planner actually reasons about.
  */
-function normaliseVllmRecipe(entry, common, at) {
+function normaliseEngineRecipe(entry, common, at) {
+  const engine = ENGINES[common.runtime];
   const overheadGB = Number(entry.overheadGB);
   if (!Number.isFinite(overheadGB) || overheadGB < 0) {
     throw new RecipeError(`${at}: overheadGB must be a number of GB (got ${entry.overheadGB})`);
@@ -382,16 +510,44 @@ function normaliseVllmRecipe(entry, common, at) {
     throw new RecipeError(`${at}: kvBytesPerToken must be a positive number (got ${entry.kvBytesPerToken})`);
   }
 
+  /*
+   * What a sequence costs on top of its KV, whatever its length.
+   *
+   * Zero for a pure attention model, and zero for any recipe that does not
+   * declare it. It exists for the hybrid models: a Gated DeltaNet layer keeps a
+   * fixed-size recurrent state per SEQUENCE rather than per token, so the cost
+   * of raising the concurrency is not only more KV pool. vLLM folds that into
+   * its KV page under `--mamba-cache-mode align`, which is why the bundled vLLM
+   * recipes leave it unset; SGLang allocates it as a pool of its own and the
+   * figure is large enough that ignoring it would misprice the run by gigabytes.
+   */
+  const stateGBPerRequest = Number(entry.stateGBPerRequest ?? 0);
+  if (!Number.isFinite(stateGBPerRequest) || stateGBPerRequest < 0) {
+    throw new RecipeError(`${at}: stateGBPerRequest must be a number of GB (got ${entry.stateGBPerRequest})`);
+  }
+
   /* The fraction is computed from the context and concurrency actually asked
    * for, so a recipe that pins it would silently defeat that. */
-  if ('--gpu-memory-utilization' in (entry.args ?? {})) {
-    throw new RecipeError(`${at}: do not set --gpu-memory-utilization; the planner computes it`);
+  if (engine.memoryFlag in (entry.args ?? {})) {
+    throw new RecipeError(`${at}: do not set ${engine.memoryFlag}; the planner computes it`);
   }
 
   const model = normaliseWeights(entry.model, `${at}.model`);
   const draft = entry.draft ? normaliseWeights(entry.draft, `${at}.draft`) : null;
   const servedName = entry.servedName ? text(entry.servedName, `${at}.servedName`, 200) : model.repoId;
-  const args = normaliseArgs(entry.args, model.repoId, servedName, `${at}.args`);
+
+  /*
+   * How the engine is told which weights to serve, and at which snapshot. vLLM
+   * takes the model positionally; SGLang takes --model-path. The revisions go
+   * in here rather than in the recipe's own args so that a pinned recipe cannot
+   * name one snapshot in `model.revision` and another in a hand-written flag.
+   */
+  const leading = [
+    ...(engine.modelFlag ? [engine.modelFlag, model.repoId] : [model.repoId]),
+    ...(model.revision ? [engine.revisionFlag, model.revision] : []),
+    ...(draft?.revision && engine.draftRevisionFlag ? [engine.draftRevisionFlag, draft.revision] : []),
+  ];
+  const args = normaliseArgs(entry.args, leading, servedName, `${at}.args`);
 
   return {
     ...common,
@@ -401,10 +557,11 @@ function normaliseVllmRecipe(entry, common, at) {
     command: [],
     /*
      * Read back out of the flags rather than declared again beside them. Null
-     * means the recipe left it to vLLM, which the UI says rather than guessing.
+     * means the recipe left it to the engine, which the UI says rather than
+     * guessing.
      */
-    contextLength: numericArg(entry.args, '--max-model-len'),
-    concurrency: numericArg(entry.args, '--max-num-seqs'),
+    contextLength: numericArg(entry.args, engine.contextFlag),
+    concurrency: numericArg(entry.args, engine.requestsFlag),
     memory: {
       weightsBytes: model.sizeBytes,
       weightsMeasured: model.measured && (draft ? draft.measured : true),
@@ -413,6 +570,8 @@ function normaliseVllmRecipe(entry, common, at) {
       overheadBytes: overheadGB * GB,
       kvBytesPerToken,
       kvMeasured: entry.kvMeasured === true,
+      statePerRequestBytes: stateGBPerRequest * GB,
+      stateMeasured: entry.stateMeasured === true,
     },
     args,
   };
@@ -429,9 +588,9 @@ function normaliseServiceRecipe(entry, common, at) {
     throw new RecipeError(`${at}: memoryGB must be a positive number of GB (got ${entry.memoryGB})`);
   }
 
-  for (const field of ['model', 'args', 'kvBytesPerToken', 'overheadGB']) {
+  for (const field of ['model', 'args', 'kvBytesPerToken', 'overheadGB', 'stateGBPerRequest']) {
     if (entry[field] !== undefined) {
-      throw new RecipeError(`${at}: ${field} belongs to a vllm recipe, not a service one`);
+      throw new RecipeError(`${at}: ${field} belongs to an engine recipe, not a service one`);
     }
   }
 
@@ -452,6 +611,8 @@ function normaliseServiceRecipe(entry, common, at) {
       memoryMeasured: entry.memoryMeasured === true,
       kvBytesPerToken: 0,
       kvMeasured: true,
+      statePerRequestBytes: 0,
+      stateMeasured: true,
     },
     args: [],
   };
@@ -539,6 +700,15 @@ export function publicRecipes() {
     contextLength: recipe.contextLength,
     concurrency: recipe.concurrency,
     weightsBytes: recipe.memory.weightsBytes + recipe.memory.draftBytes,
+    /* The flags the tuning is passed as. The panel previews the argv a run
+     * would get, and it cannot spell them without knowing the engine. */
+    flags: ENGINES[recipe.runtime]
+      ? {
+          context: ENGINES[recipe.runtime].contextFlag,
+          requests: ENGINES[recipe.runtime].requestsFlag,
+          memory: ENGINES[recipe.runtime].memoryFlag,
+        }
+      : null,
     args: recipe.args,
     notes: recipe.notes,
   }));
@@ -638,12 +808,13 @@ const ceil2 = (value) => Math.ceil(value * 100) / 100;
  * fixed for the recipe.
  */
 export function sizeFor(recipe, tuning) {
-  if (recipe.runtime !== 'vllm') {
+  if (!isEngine(recipe.runtime)) {
     return {
       weightsBytes: 0,
       overheadBytes: recipe.memory.overheadBytes,
       kvTokens: 0,
       kvBytes: 0,
+      stateBytes: 0,
       requiredBytes: recipe.memory.overheadBytes,
     };
   }
@@ -651,52 +822,94 @@ export function sizeFor(recipe, tuning) {
   const weightsBytes = recipe.memory.weightsBytes + recipe.memory.draftBytes;
   const kvTokens = tuning.contextLength * tuning.maxRequests;
   const kvBytes = kvTokens * recipe.memory.kvBytesPerToken;
+  /* Per sequence, not per token: the recurrent state of a hybrid model's linear
+   * layers, which is the same size whether the sequence is 1 token or 260k -
+   * plus whatever spare slots the engine allocates beside the ones asked for. */
+  const stateBytes =
+    recipe.memory.statePerRequestBytes *
+    (tuning.maxRequests + (ENGINES[recipe.runtime]?.statePaddingSlots ?? 0));
 
   return {
     weightsBytes,
     overheadBytes: recipe.memory.overheadBytes,
     kvTokens,
     kvBytes,
-    requiredBytes: weightsBytes + recipe.memory.overheadBytes + kvBytes,
+    stateBytes,
+    requiredBytes: weightsBytes + recipe.memory.overheadBytes + kvBytes + stateBytes,
   };
 }
 
 export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
   const pool = memoryPool(snapshot);
-  const isVllm = recipe.runtime === 'vllm';
+  const engine = ENGINES[recipe.runtime] ?? null;
   const tuning = resolveTuning(recipe, requested);
   const size = sizeFor(recipe, tuning);
   const { weightsBytes, requiredBytes } = size;
 
   /*
-   * The smallest fraction of TOTAL memory that still covers what was asked for.
-   * vLLM compares its fraction against FREE memory but computes it from total,
-   * so this is the number that decides whether the server starts at all.
+   * What the fraction has to cover, which is not the same question for the two
+   * engines: vLLM's block holds everything, SGLang's holds the weights and the
+   * pools while activation and graph capture come out of the remainder. Asking
+   * SGLang for the overhead as well would hand the surplus to the KV pool,
+   * which is not wrong so much as a different setting than the one priced.
+   */
+  const fractionBytes = !engine
+    ? null
+    : engine.memoryCoversOverhead
+      ? requiredBytes
+      : requiredBytes - size.overheadBytes;
+
+  /*
+   * What the engine's fraction is a fraction OF - total memory for vLLM, free
+   * memory for SGLang. On an idle box these are nearly the same number and the
+   * distinction looks academic; beside a resident server they are not, and
+   * getting it wrong is how a run boots successfully with a pool a tenth of the
+   * size it was priced at.
+   */
+  const fractionBasisBytes = !engine
+    ? null
+    : engine.memoryFractionOf === 'free'
+      ? pool.availableBytes
+      : pool.totalBytes;
+
+  /*
+   * The smallest fraction that still covers what was asked for. vLLM compares
+   * its fraction against free memory but computes it from total, so for vLLM
+   * this is also the number that decides whether the server starts at all.
    *
    * A service reserves nothing up front - it allocates as it works - so there
    * is no fraction to compute and its declared figure is the whole story.
    */
   const minUtilization =
-    isVllm && pool.totalBytes
-      ? Math.min(MAX_UTILIZATION, Math.max(MIN_UTILIZATION, ceil2(requiredBytes / pool.totalBytes)))
+    engine && fractionBasisBytes
+      ? Math.min(MAX_UTILIZATION, Math.max(MIN_UTILIZATION, ceil2(fractionBytes / fractionBasisBytes)))
       : null;
 
   /* An override buys a deeper prefix cache; below the minimum the KV pool can
-   * no longer hold one full-length request and vLLM refuses to start. */
-  const utilization = isVllm ? (tuning.override ?? minUtilization) : null;
-  const claimBytes = pool.totalBytes && utilization ? utilization * pool.totalBytes : null;
+   * no longer hold one full-length request and the engine refuses to start. */
+  const utilization = engine ? (tuning.override ?? minUtilization) : null;
+  /*
+   * What the run will actually take out of the machine. For vLLM that is the
+   * block and nothing else; for SGLang the overhead sits outside the fraction,
+   * so it is added back here - otherwise a fraction that just fits would be
+   * shown as fitting while the server went on to allocate gigabytes more.
+   */
+  const claimBytes =
+    fractionBasisBytes && utilization
+      ? utilization * fractionBasisBytes + (engine.memoryCoversOverhead ? 0 : size.overheadBytes)
+      : null;
 
   const cached = new Set((snapshot.hf?.repos ?? []).map((repo) => repo.repoId));
 
   /*
    * Whether the weights are already here, which for the two runtimes is a
-   * different question. A vLLM repo either appears in `hf cache ls` or does
+   * different question. An engine's repo either appears in `hf cache ls` or does
    * not; a service's files live in a directory of its own, so the poll measures
    * that directory and it counts as present once it is nearly the declared size
    * - `hf download` skips what it already has, so a part-filled directory means
    * part of the fetch remains.
    */
-  const repos = isVllm
+  const repos = engine
     ? [recipe.model, recipe.draft].filter(Boolean).map((repo) => ({
         repoId: repo.repoId,
         repoType: repo.repoType,
@@ -712,7 +925,7 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
 
   /* Only what is missing costs disk. The split follows the declared sizes, so a
    * partly-fetched recipe still reports a sensible remainder. */
-  const downloadBytes = isVllm
+  const downloadBytes = engine
     ? toDownload.reduce(
         (sum, repo) =>
           sum + (repo.repoId === recipe.draft?.repoId ? recipe.memory.draftBytes : recipe.memory.weightsBytes),
@@ -787,8 +1000,8 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
       });
     }
     /*
-     * vLLM's own startup check, and the one that actually refuses: it compares
-     * gpu-memory-utilization x TOTAL memory against FREE memory. On an
+     * The engine's own startup check, and the one that actually refuses: it
+     * compares its fraction x TOTAL memory against FREE memory. On an
      * otherwise-idle Spark 0.95 asks for 115.6 GiB against 114.97 GiB free and
      * the server exits rather than starting - short by 0.63 GiB. Catching it
      * here turns a five-minute weight load ending in an exit into a refusal.
@@ -797,9 +1010,9 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
       blockers.push({
         code: 'gpu-memory-utilization',
         message:
-          `vLLM will ask for ${round(claimBytes)} GB (${utilization} of total) but only ` +
-          `${round(pool.availableBytes)} GB is free - shorten the context, lower the request ` +
-          `count, or free some memory`,
+          `${recipe.runtime} will ask for ${round(claimBytes)} GB (${engine.memoryFlag} ` +
+          `${utilization} of total) but only ${round(pool.availableBytes)} GB is free - shorten ` +
+          `the context, lower the request count, or free some memory`,
       });
     }
   }
@@ -840,7 +1053,7 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
       message: 'nobody is signed in to the Hub on this node, so gated repos will fail',
     });
   }
-  if (!isVllm && recipe.memory.memoryMeasured === false) {
+  if (!engine && recipe.memory.memoryMeasured === false) {
     warnings.push({
       code: 'estimate',
       message:
@@ -848,13 +1061,21 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
         `not measured from a run`,
     });
   }
-  if (isVllm && !recipe.memory.weightsMeasured) {
+  if (engine && !recipe.memory.weightsMeasured) {
     warnings.push({
       code: 'estimate',
       message: `the ${round(weightsBytes)} GB weight figure is estimated from the parameter count, not measured`,
     });
   }
-  if (isVllm && !recipe.memory.kvMeasured) {
+  if (engine && recipe.memory.statePerRequestBytes > 0 && !recipe.memory.stateMeasured) {
+    warnings.push({
+      code: 'state-estimate',
+      message:
+        `the ${round(recipe.memory.statePerRequestBytes)} GB of recurrent state per request is an ` +
+        `estimate, so the cost of raising the request count moves with it`,
+    });
+  }
+  if (engine && !recipe.memory.kvMeasured) {
     warnings.push({
       code: 'kv-estimate',
       message:
@@ -872,6 +1093,8 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
       overheadBytes: size.overheadBytes,
       kvBytes: size.kvBytes,
       kvTokens: size.kvTokens,
+      /* Zero for everything but a hybrid model, where it is per request. */
+      stateBytes: size.stateBytes,
       requiredBytes,
       claimBytes,
       availableBytes: pool.availableBytes,
@@ -879,11 +1102,13 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
     },
     /* Null for a service: there is nothing to tune, and the panel hides the
      * sliders rather than showing controls that do nothing. */
-    tuning: !isVllm ? null : {
+    tuning: !engine ? null : {
       contextLength: tuning.contextLength,
       maxRequests: tuning.maxRequests,
       gpuMemoryUtilization: utilization,
       minUtilization,
+      /* The flag this fraction is passed as, which differs per engine. */
+      memoryFlag: engine.memoryFlag,
       /* False once the user has pinned a fraction of their own. */
       automatic: tuning.override === null,
       contextOptions: contextOptions(recipe),
@@ -920,11 +1145,12 @@ export function buildPlanner(snapshot, runs = []) {
 export function resolveArgs(recipe, tuning) {
   /* A service takes no serving flags at all - its image's own entrypoint knows
    * how to start it - so there is nothing to resolve. */
-  if (recipe.runtime !== 'vllm') return [];
+  const engine = ENGINES[recipe.runtime];
+  if (!engine) return [];
 
   const overrides = {
-    '--max-model-len': String(tuning.contextLength),
-    '--max-num-seqs': String(tuning.maxRequests),
+    [engine.contextFlag]: String(tuning.contextLength),
+    [engine.requestsFlag]: String(tuning.maxRequests),
   };
 
   const args = [];
@@ -943,6 +1169,6 @@ export function resolveArgs(recipe, tuning) {
    * about the shape it was priced for. */
   for (const [flag, value] of Object.entries(overrides)) args.push(flag, value);
 
-  args.push('--gpu-memory-utilization', String(tuning.gpuMemoryUtilization));
+  args.push(engine.memoryFlag, String(tuning.gpuMemoryUtilization));
   return args;
 }

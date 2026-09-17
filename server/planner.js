@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { createRunner } from './exec/index.js';
 import { HF_RESOLVE, HF_DRY_RUN_TOTAL, cacheFolderName } from './collectors/huggingface.js';
 import { RUNS_DIR, RUN_ID_RE } from './collectors/planner.js';
-import { ARG_RE, HOST_PATH_RE, recipeById, resolveArgs } from './recipes.js';
+import { ARG_RE, ENGINES, HOST_PATH_RE, isEngine, recipeById, resolveArgs } from './recipes.js';
 import { getSecret } from './vault.js';
 
 /*
@@ -96,21 +96,39 @@ async function withRunner(node, fn) {
  * run (a dry run prices the whole repo, not the slice being asked for).
  */
 function downloadSection(recipe) {
-  return recipe.runtime === 'vllm' ? vllmDownloads(recipe) : serviceDownloads(recipe);
+  return isEngine(recipe.runtime) ? engineDownloads(recipe) : serviceDownloads(recipe);
 }
 
-function vllmDownloads(recipe) {
+/*
+ * One `hf download` per repo, at the recipe's pinned revision where it has one.
+ *
+ * PINNING COSTS A refs/main, AND THAT MATTERS. `hf download --revision <sha>`
+ * writes the snapshot but no refs/ directory at all, and a loader that resolves
+ * a repo without being given a revision then reads a file that is not there.
+ * SGLang has exactly one such call - the speculative-algorithm alias resolver
+ * reads the DRAFT config with no revision, before any of the flags that carry
+ * one - so a recipe pinned by sha alone crash-loops after a several-minute
+ * weight load, which looks like a bad configuration rather than a missing file.
+ * The fix is one file, so the run writes it: refs/main for each pinned repo,
+ * pointing at the snapshot it just fetched.
+ *
+ * It is written only when absent. A refs/main already in the cache is somebody
+ * else's - another recipe, or a plain `hf download` - and repointing it would
+ * change which snapshot every other reader of that repo gets.
+ */
+function engineDownloads(recipe) {
   const repos = [recipe.model, recipe.draft].filter(Boolean);
+  const revisionArg = (repo) => (repo.revision ? ` --revision ${sq(repo.revision)}` : '');
 
   const measure = repos
-    .map((repo) => `  "$HF" download ${sq(repo.repoId)} --type ${sq(repo.repoType)} --dry-run --format json 2>/dev/null | ${HF_DRY_RUN_TOTAL}`)
+    .map((repo) => `  "$HF" download ${sq(repo.repoId)} --type ${sq(repo.repoType)}${revisionArg(repo)} --dry-run --format json 2>/dev/null | ${HF_DRY_RUN_TOTAL}`)
     .join('\n');
 
   const fetch = repos
     .map(
       (repo) =>
-        `say "--- fetching ${repo.repoId}"\n` +
-        `"$HF" download ${sq(repo.repoId)} --type ${sq(repo.repoType)} --max-workers 8 >> "$D/log" 2>&1 \\\n` +
+        `say "--- fetching ${repo.repoId}${repo.revision ? ` at ${repo.revision}` : ''}"\n` +
+        `"$HF" download ${sq(repo.repoId)} --type ${sq(repo.repoType)}${revisionArg(repo)} --max-workers 8 >> "$D/log" 2>&1 \\\n` +
         `  || { say "could not download ${repo.repoId}"; finish 1; }`,
     )
     .join('\n');
@@ -119,7 +137,23 @@ function vllmDownloads(recipe) {
     .map((repo) => `printf '%s\\n' "$HUB/${cacheFolderName(repo.repoType, repo.repoId)}/blobs" >> "$D/dirs"`)
     .join('\n');
 
-  return { measure, fetch, dirs };
+  /* Only a pinned repo needs this; an unpinned one was fetched through main and
+   * already has the file. The snapshot must hold weights before it is named:
+   * an interrupted fetch can leave one holding nothing but a tokenizer, and a
+   * refs/main pointing there fails a load with a message about an image
+   * processor rather than about the cache. */
+  const refs = repos
+    .filter((repo) => repo.revision)
+    .map((repo) => {
+      const dir = `"$HUB/${cacheFolderName(repo.repoType, repo.repoId)}"`;
+      return `if [ ! -f ${dir}/refs/main ] && [ -n "$(ls ${dir}/snapshots/${sq(repo.revision)}/*.safetensors 2>/dev/null)" ]; then
+  mkdir -p ${dir}/refs && printf '%s' ${sq(repo.revision)} > ${dir}/refs/main \\
+    && say "wrote refs/main for ${repo.repoId} -> ${repo.revision}"
+fi`;
+    })
+    .join('\n');
+
+  return { measure, fetch, dirs, refs };
 }
 
 function serviceDownloads(recipe) {
@@ -146,7 +180,8 @@ function serviceDownloads(recipe) {
     .map((entry) => `printf '%s\\n' "$HUB/${cacheFolderName(entry.repoType, entry.repoId)}/blobs" >> "$D/dirs"`)
     .join('\n');
 
-  return { measure, fetch, dirs };
+  /* A service's files are fetched through main, so there is no ref to write. */
+  return { measure, fetch, dirs, refs: '' };
 }
 
 /*
@@ -204,7 +239,7 @@ docker build -t ${ref} "$D/build" >> "$D/log" 2>&1 \\
  * whichever image a recipe names.
  */
 function dockerRunSection(recipe, { port, apiKey, cpuset, tuning }) {
-  const isVllm = recipe.runtime === 'vllm';
+  const engine = ENGINES[recipe.runtime] ?? null;
 
   const flags = [
     '-d',
@@ -217,39 +252,36 @@ function dockerRunSection(recipe, { port, apiKey, cpuset, tuning }) {
     ...(cpuset ? [`--cpuset-cpus ${sq(cpuset)}`] : []),
     `-p ${sq(`0.0.0.0:${port}:${recipe.containerPort}`)}`,
     ...recipe.env.map((entry) => `-e ${sq(`${entry.key}=${entry.value}`)}`),
+    /*
+     * Whatever the recipe asked to be bound. Engines want this as much as
+     * services do: an SGLang recipe keeps its FlashInfer autotune draws on the
+     * host, and without the mount every boot re-times every kernel and lands
+     * somewhere else on the throughput distribution.
+     */
+    ...recipe.volumes.map(
+      (mount) => `-v ${hostPath(mount.host)}:${sq(mount.container)}${mount.readOnly ? ':ro' : ''}`,
+    ),
   ];
 
-  if (isVllm) {
+  if (engine) {
     /*
-     * The caches vLLM recipes always want. These are shell expressions rather
+     * The caches an engine always wants. These are shell expressions rather
      * than declared volumes because HF_HOME has to be honoured on the node,
      * where its value is known and ours is not.
      */
-    flags.push(
-      '-e HF_TOKEN="${HF_TOKEN:-}"',
-      '-v "$HF_CACHE:/root/.cache/huggingface"',
-      '-v "$HOME/.cache/vllm:/root/.cache/vllm"',
-      /*
-       * Pinned deliberately, and the one thing that works against both image
-       * families: the spark-arena builds set no entrypoint, while
-       * vllm/vllm-openai already runs `vllm serve`, so passing `vllm serve ...`
-       * to the latter yields `vllm serve vllm serve ...` and argparse rejects
-       * it. Pinning makes the argv identical whichever image a recipe names.
-       */
-      '--entrypoint vllm',
-    );
+    flags.push('-e HF_TOKEN="${HF_TOKEN:-}"', '-v "$HF_CACHE:/root/.cache/huggingface"');
+    if (engine.cacheVolume) {
+      flags.push(`-v "${engine.cacheVolume.host}:${engine.cacheVolume.container}"`);
+    }
+    /* Pinned only where the image family makes it necessary - see ENGINES. */
+    if (engine.entrypoint) flags.push(`--entrypoint ${sq(engine.entrypoint)}`);
   } else {
-    /* A service keeps its state where it chooses, and starts itself: its image
-     * has an entrypoint that knows how, so nothing is pinned or appended. */
+    /*
+     * Each weight file individually, read-only, from the cache snapshot onto
+     * the path the service expects. Docker resolves the cache's symlink to
+     * its blob, so the container sees an ordinary file where it wants one.
+     */
     flags.push(
-      ...recipe.volumes.map(
-        (mount) => `-v ${hostPath(mount.host)}:${sq(mount.container)}${mount.readOnly ? ':ro' : ''}`,
-      ),
-      /*
-       * Each weight file individually, read-only, from the cache snapshot onto
-       * the path the service expects. Docker resolves the cache's symlink to
-       * its blob, so the container sees an ordinary file where it wants one.
-       */
       ...recipe.weights.flatMap((entry, i) =>
         entry.files.map((file) => `-v "$SNAP_${i}/${file}":'${entry.mountBase}/${file}':ro`),
       ),
@@ -259,14 +291,23 @@ function dockerRunSection(recipe, { port, apiKey, cpuset, tuning }) {
   /* The tuned context, concurrency and memory fraction replace the recipe's
    * defaults here, so the container is given exactly what the panel priced.
    * A service has no such flags and is launched bare. */
-  const args = isVllm ? [...resolveArgs(recipe, tuning), '--api-key', apiKey].map(sq) : [];
+  const args = engine
+    ? [
+        ...resolveArgs(recipe, tuning),
+        '--api-key',
+        apiKey,
+        /* An engine that would otherwise bind loopback inside the container,
+         * publishing a port that answers nothing. */
+        ...(engine.bindFlags ? ['--host', '0.0.0.0', '--port', String(recipe.containerPort)] : []),
+      ].map(sq)
+    : [];
 
   /* A service's own entrypoint starts it; anything here replaces the image's
    * CMD, which is how a recipe corrects a default that is wrong for this node. */
   const serviceCommand = recipe.command.map(sq).join(' ');
 
-  const command = isVllm
-    ? `${sq(recipe.image.ref)} serve \\\n  ${args.join(' ')}`
+  const command = engine
+    ? `${sq(recipe.image.ref)} ${engine.command.map(sq).join(' ')} \\\n  ${args.join(' ')}`
     : `${sq(recipe.image.ref)}${serviceCommand ? ` ${serviceCommand}` : ''}`;
 
   return `docker run ${flags.join(' ')} \\\n  ${command} >> "$D/log" 2>&1`;
@@ -335,6 +376,8 @@ ${download.measure}
 } | awk '{s+=$1} END{printf "%d\\n", s+0}' > "$D/total" 2>/dev/null || echo 0 > "$D/total"
 
 ${download.fetch}
+
+${download.refs || ': no pinned revisions to record'}
 
 # ------------------------------------------------------------------ image ----
 set_phase image
@@ -439,8 +482,15 @@ export function buildRunMeta({ runId, recipe, port, apiKey, tuning }) {
  * A runtime that does not authenticate gets none either way: ComfyUI has no
  * auth at all, and advertising a key it ignores would be worse than showing none.
  */
+/*
+ * Whether the SERVER authenticates is not the same question as whether the
+ * readiness PROBE sends a key. SGLang takes --api-key like vLLM does, and
+ * exempts its own health endpoints from it - so the probe carries no key while
+ * everything a client can actually call still needs one. The runtime decides
+ * this, not the probe.
+ */
 export function apiKeyFor(recipe) {
-  if (recipe.readiness.auth !== 'bearer') return null;
+  if (!isEngine(recipe.runtime) && recipe.readiness.auth !== 'bearer') return null;
   return getSecret('VLLM_API_KEY') ?? `sk-${crypto.randomBytes(24).toString('hex')}`;
 }
 
@@ -453,7 +503,7 @@ export async function startRun(node, { recipeId, port, tuning } = {}) {
    * must not be something a caller can assert. A service has nothing to tune,
    * so it carries none and none is required.
    */
-  if (recipe.runtime === 'vllm' && (!tuning?.contextLength || !tuning?.maxRequests || !tuning?.gpuMemoryUtilization)) {
+  if (isEngine(recipe.runtime) && (!tuning?.contextLength || !tuning?.maxRequests || !tuning?.gpuMemoryUtilization)) {
     throw bad('a resolved plan is required to start a run');
   }
 
