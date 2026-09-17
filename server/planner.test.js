@@ -454,7 +454,7 @@ test('an sglang recipe goes through the image entrypoint rather than replacing i
  * publishes a port that answers nothing. */
 test('an sglang container is told to bind every interface, on its own port', () => {
   const script = scriptFor(SGLANG_RUN);
-  assert.ok(script.includes(`'--host' '0.0.0.0' '--port' '8003'`));
+  assert.ok(script.includes(`'--host' '0.0.0.0' '--port' '8000'`));
 });
 
 /*
@@ -495,10 +495,10 @@ test('an sglang recipe mounts its declared caches', () => {
 test('an sglang server is keyed even though its probe is not', () => {
   /* Published on the recipe's own port here, so the probe URL is the one a
    * real run of it would use. */
-  const script = scriptFor(SGLANG_RUN, { port: 8003 });
+  const script = scriptFor(SGLANG_RUN, { port: 8000 });
 
   assert.ok(script.includes(`'--api-key' '${API_KEY}'`));
-  assert.match(script, /"http:\/\/127\.0\.0\.1:8003\/health_generate"/);
+  assert.match(script, /"http:\/\/127\.0\.0\.1:8000\/health_generate"/);
   assert.equal(script.includes(`Authorization: Bearer ${API_KEY}`), false);
   assert.equal(apiKeyFor(recipeById(SGLANG_RUN)) === null, false);
 });

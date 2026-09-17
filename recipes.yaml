@@ -1497,9 +1497,16 @@
         - curl -fsSL --create-dirs -o /sgl-workspace/sglang/python/sglang/srt/speculative/dflash_utils.py https://raw.githubusercontent.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2/60639a9794c13ba8f988e0dd92fef77c68793d30/image/python/sglang/srt/speculative/dflash_utils.py
         - curl -fsSL --create-dirs -o /sgl-workspace/sglang/python/sglang/srt/speculative/dflash_worker_v2.py https://raw.githubusercontent.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2/60639a9794c13ba8f988e0dd92fef77c68793d30/image/python/sglang/srt/speculative/dflash_worker_v2.py
   container: spark-run-qwen38-sglang-dflash2
-  # Their port, and not 8000: the vLLM recipe for this model publishes 8000, and
-  # a node can hold both containers at once.
-  port: 8003
+  # 8000, the same port every other engine recipe here publishes, so a client
+  # configured once keeps working whichever engine is serving. The upstream
+  # script uses 8003 for the opposite reason - it expects to sit beside a vLLM
+  # server rather than replace one.
+  #
+  # The consequence is deliberate: the vLLM recipe for this model publishes 8000
+  # too, so the two cannot be resident at once. The planner refuses the second
+  # one with a "port is already published" blocker rather than letting docker
+  # fail the run. Change this to 8003 to run both.
+  port: 8000
   volumes:
     # FlashInfer autotunes at every boot and keeps the result in memory, so
     # without this mount each boot re-times every kernel and lands somewhere

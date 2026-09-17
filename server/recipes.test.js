@@ -997,9 +997,21 @@ test('the shipped sglang recipe is the same model on the other engine', () => {
   const vllm = recipeById(KEPT);
 
   assert.equal(sg.runtime, 'sglang');
-  /* Different port, so both can be resident at once. */
-  assert.notEqual(sg.port, vllm.port);
   assert.notEqual(sg.containerName, vllm.containerName);
+  /*
+   * The SAME port as the vLLM recipe for this model, so one client
+   * configuration works whichever engine is serving - which also means the two
+   * cannot be resident at once. That is a blocker rather than a failed docker
+   * run: the planner sees the published port and refuses.
+   */
+  assert.equal(sg.port, vllm.port);
+  const busy = planOf(
+    sg,
+    roomyNode({
+      containers: [{ name: vllm.containerName, state: 'running', ports: [`${vllm.port}->${vllm.port}/tcp`] }],
+    }),
+  );
+  assert.match(busy.blockers.find((b) => b.code === 'port').message, /already published by/);
   /* Its tactic cache is a declared volume: without the mount every boot
    * re-times every FlashInfer kernel. */
   assert.equal(sg.volumes.some((v) => v.container === '/root/.cache/sglang'), true);
