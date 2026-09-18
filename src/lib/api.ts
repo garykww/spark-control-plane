@@ -44,10 +44,15 @@ export interface NodeInput {
 
 /* The knobs a run can be tuned with. Every one is optional; the server falls
  * back to the recipe's own defaults for whatever is missing. */
+/* What the panel may ask for: the three knobs the memory estimate moves with,
+ * and the host port to publish on. All optional - anything omitted falls back
+ * to the recipe's own value. Both the pricing and the launch route take the
+ * same shape, so one piece of panel state feeds both. */
 export interface RunTuning {
   contextLength?: number;
   maxRequests?: number;
   gpuMemoryUtilization?: number | null;
+  port?: number | null;
 }
 
 export const api = {
@@ -127,7 +132,7 @@ export const api = {
 
   /* Returns once the sequence is under way on the node, not when the model is
    * serving - the first run of a recipe downloads tens of gigabytes. */
-  startRun: (nodeId: string, body: RunTuning & { recipeId: string; port?: number }) =>
+  startRun: (nodeId: string, body: RunTuning & { recipeId: string }) =>
     request<{ ok: boolean; runId: string; apiKey: string; port: number }>(`/nodes/${nodeId}/runs`, {
       method: 'POST',
       body: JSON.stringify(body),
