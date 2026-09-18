@@ -775,6 +775,34 @@ export function contextOptions(recipe) {
 
 export const requestOptions = () => [...REQUEST_STEPS];
 
+/*
+ * The port the run publishes on the node, which is the recipe's unless the
+ * caller asks for another.
+ *
+ * A recipe declares a port because a serving configuration has a natural one,
+ * not because the node has to agree: 8000 may already be taken by something
+ * that has nothing to do with this catalogue, and before this the only answer
+ * was a blocker with no way past it. Only the HOST side moves - the container
+ * still listens on containerPort and the mapping absorbs the difference - so
+ * nothing in the recipe's own argv changes with it.
+ *
+ * `valid` is carried rather than thrown on, because this is reached from the
+ * pricing route on every keystroke: a half-typed port should price as a
+ * blocker the panel can explain, not as a 400 that blanks the panel.
+ */
+function resolvePort(recipe, requested = {}) {
+  const asked = requested.port;
+  if (asked === undefined || asked === null || asked === '') {
+    return { port: recipe.port, valid: true, overridden: false };
+  }
+
+  const port = Number(asked);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return { port: recipe.port, valid: false, overridden: true, asked };
+  }
+  return { port, valid: true, overridden: port !== recipe.port };
+}
+
 function resolveTuning(recipe, tuning = {}) {
   const ceiling = recipe.contextLength ?? CONTEXT_STEPS.at(-1);
   const wantedContext = Number(tuning.contextLength);
@@ -839,10 +867,20 @@ export function sizeFor(recipe, tuning) {
   };
 }
 
+/*
+ * The HOST port of a docker mapping. `docker ps` lists exposed-but-unpublished
+ * ports too ("8000/tcp" with no arrow) and those hold nothing on the host; the
+ * collector has already stripped the host IP, so the text before "->" is the
+ * host port and its absence means nothing was published.
+ */
+const publishedPort = (mapping) =>
+  mapping.includes('->') ? Number.parseInt(mapping, 10) : null;
+
 export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
   const pool = memoryPool(snapshot);
   const engine = ENGINES[recipe.runtime] ?? null;
   const tuning = resolveTuning(recipe, requested);
+  const chosen = resolvePort(recipe, requested);
   const size = sizeFor(recipe, tuning);
   const { weightsBytes, requiredBytes } = size;
 
@@ -938,21 +976,15 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
   const mount = cacheMount(snapshot);
   const imagePresent = snapshot.dockerImages ? snapshot.dockerImages.includes(recipe.image.ref) : null;
 
-  /*
-   * Only a PUBLISHED port is in the way. `docker ps` lists exposed-but-unpublished
-   * ports too ("8000/tcp" with no arrow), and those hold nothing on the host - the
-   * collector has already stripped the host IP, so the text before "->" is the
-   * host port and its absence means nothing was published.
-   */
-  const publishedPort = (mapping) =>
-    mapping.includes('->') ? Number.parseInt(mapping, 10) : null;
-
-  const portHolder = (snapshot.containers ?? []).find(
+  /* Only meaningful once there is a real port to check: an unusable one falls
+   * back to the recipe's, and reporting a conflict on a port the caller never
+   * asked for reads as two problems where there is one. */
+  const portHolder = !chosen.valid ? null : (snapshot.containers ?? []).find(
     (container) =>
       container.state === 'running' &&
       /* Re-running a recipe replaces its own container, so its own name is fine. */
       container.name !== recipe.containerName &&
-      container.ports.some((mapping) => publishedPort(mapping) === recipe.port),
+      container.ports.some((mapping) => publishedPort(mapping) === chosen.port),
   );
 
   const activeRun = runs.find((run) => ACTIVE_RUN_STATUSES.has(run.status));
@@ -981,10 +1013,18 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
       message: `${activeRun.recipeName ?? 'another recipe'} is already being started on this node`,
     });
   }
+  if (!chosen.valid) {
+    blockers.push({
+      code: 'port-invalid',
+      message: `${chosen.asked} is not a usable port - it must be a whole number between 1 and 65535`,
+    });
+  }
   if (portHolder) {
     blockers.push({
       code: 'port',
-      message: `port ${recipe.port} is already published by "${portHolder.name}"`,
+      message:
+        `port ${chosen.port} is already published by "${portHolder.name}"` +
+        (chosen.overridden ? '' : ' - publish this run on another port, or stop that container'),
     });
   }
 
@@ -1087,6 +1127,10 @@ export function planRecipe(recipe, snapshot, runs = [], requested = {}) {
   return {
     recipeId: recipe.id,
     fits: blockers.length === 0,
+    /* What this plan was priced and checked against, so the run publishes the
+     * same port the conflict check just cleared. */
+    port: chosen.port,
+    defaultPort: recipe.port,
     memory: {
       unified: pool.unified,
       weightsBytes,
