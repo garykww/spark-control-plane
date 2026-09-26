@@ -140,7 +140,8 @@
     --max-num-seqs: 1
     --max-num-batched-tokens: 8192
     --kv-cache-dtype: fp8
-    # k caps at 7: the drafter's dflash_config.block_size is 8.
+    # k caps at 7 on 0.28: the drafter's dflash_config.block_size is 8. 0.30
+    # lifts that - see the recipe below.
     --speculative-config: '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'
     --enable-auto-tool-choice: true
     --tool-call-parser: qwen3_coder
@@ -155,6 +156,86 @@
     - >-
       Check the startup log says "DFlash2DraftModel": a DFlash2 checkpoint on a
       runtime older than 0.27.1 silently drafts as DFlash1.
+
+# ---------------------------------------------------------------------------
+# The recipe above on vLLM 0.30.0 at the SGLang recipe's draft budget. It stays
+# a separate entry so the two can be run back to back on the same box.
+#
+# The draft budget. vLLM 0.30's DFlash2 no longer ties k to the drafter's
+# dflash_config.block_size: qwen3_dflash2.py sizes its local convolution as
+# 1 + num_speculative_tokens ("the bonus token plus the mask tokens"), and
+# config/speculative.py applies no block_size check to method dflash. So the
+# cap of 7 above is gone.
+#
+# k is 15, not 16. SGLang's --speculative-num-draft-tokens counts the anchor:
+# its DFlash worker verifies blocks of that many tokens, with position 0 the
+# current token and gamma = block_size - 1 drafts (pangoleen's
+# dflash_worker_v2.py at 60639a97). Their "budget of 16", measured at 6.8-8.3
+# accepted per pass and 8 -> 16 worth +69% on edits, is therefore 15 drafts.
+# In vLLM the same verify pass is k=15: a 16-token block, a power of two, which
+# is the fast path in _grouped_conv. k=16 would verify 17 tokens.
+#
+# NOT YET MEASURED on a Spark. The memory figures are the 0.28 recipe's:
+#   kvBytesPerToken  a property of the architecture and fp8 KV, but 0.29/0.30
+#                    changed hybrid block sizing (#53007, #55450), so the
+#                    startup log's "Setting attention block size" line and pool
+#                    size need re-reading before it is marked measured.
+#   overheadGB       the verify batch grows from 8 to 16 tokens per request,
+#                    which is small next to the 8192-token prefill chunk that
+#                    sets peak activation, but 0.29 also changed CUDA graph
+#                    capture sizes (#50488, #54418). Rounded up by 1 GB until
+#                    a startup log says otherwise.
+- id: qwen38-27b-nvfp4-dflash2-v030
+  name: Qwen3.8-27B · NVFP4 + DFlash2 k=15 (vLLM 0.30)
+  summary: >-
+    The DFlash2 recipe on vLLM 0.30.0 at the draft budget the SGLang recipe
+    runs. Not yet measured on a Spark: run it beside the 0.28 recipe to compare.
+  model:
+    repo: RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
+    sizeGB: 23.8
+    measured: true
+  draft:
+    repo: incoai/Qwen3.8-27B-DFlash2
+    sizeGB: 3.8
+    measured: true
+  image:
+    # Checked on Docker Hub: an arm64-only tag, like the 0.28 one above.
+    ref: vllm/vllm-openai:v0.30.0-aarch64
+  container: spark-run-qwen38-nvfp4-dflash2-v030
+  port: 8000
+  # Carried over from the 0.28 recipe (7.61 GiB measured), plus 1 GB - see above.
+  overheadGB: 9.2
+  # Carried over from the 0.28 recipe; not re-measured on 0.30.
+  kvBytesPerToken: 44827
+  kvMeasured: false
+  args:
+    --tensor-parallel-size: 1
+    --distributed-executor-backend: mp
+    --trust-remote-code: true
+    --enable-prefix-caching: true
+    --enable-chunked-prefill: true
+    --attention-backend: FLASHINFER
+    --mamba-ssm-cache-dtype: bfloat16
+    --mamba-cache-mode: align
+    --max-model-len: 262144
+    --max-num-seqs: 1
+    --max-num-batched-tokens: 8192
+    --kv-cache-dtype: fp8
+    --speculative-config: '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":15}'
+    --enable-auto-tool-choice: true
+    --tool-call-parser: qwen3_coder
+    --reasoning-parser: qwen3
+  notes:
+    - >-
+      Unmeasured. Compare tok/s and the logged mean acceptance length against
+      the 0.28 recipe (45.6 tok/s, 4.70 on code) before switching to it.
+    - >-
+      Check the startup log for "DFlash2DraftModel", and for which model runner
+      it chose: 0.29 made Model Runner V2 the default but falls back to V1 for
+      some speculative methods.
+    - >-
+      k=15 matches SGLang's budget of 16, which counts the anchor token. Past
+      the drafter's trained block of 8, acceptance is the thing to watch.
 
 # ---------------------------------------------------------------------------
 # Ported from serve-qwen36-35b-a3b-dflash.sh.
