@@ -80,8 +80,26 @@ test('parseContainers stays silent when docker is simply not installed', () => {
   assert.equal(result.error, null);
 });
 
-test('parseContainers treats no output as no containers', () => {
+test('parseContainers treats no output as docker being unavailable', () => {
   assert.deepEqual(parseContainers(''), { containers: [], error: null, available: false });
+});
+
+test('parseContainers reports a working daemon with no containers as available', () => {
+  assert.deepEqual(parseContainers('docker-exit:0'), { containers: [], error: null, available: true });
+});
+
+test('parseContainers still reports a failure when docker exits non-zero', () => {
+  const result = parseContainers('Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\ndocker-exit:1');
+  assert.equal(result.available, false);
+  assert.match(result.error, /daemon is not running/);
+});
+
+test('parseContainers ignores the exit line when reading containers', () => {
+  const { containers, available } = parseContainers(
+    `${row({ ID: ID_A, Names: 'web', State: 'running' })}\ndocker-exit:0`,
+  );
+  assert.equal(containers.length, 1);
+  assert.equal(available, true);
 });
 
 test('parseContainers ignores rows without a valid container id', () => {
