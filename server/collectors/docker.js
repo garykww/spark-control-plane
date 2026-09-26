@@ -7,10 +7,13 @@
  * stderr is folded into the section rather than discarded, because the most
  * common failure has a specific fix the user needs to see: the SSH user is not
  * in the `docker` group, and the daemon answers "permission denied".
+ *
+ * The exit status is echoed after the listing because an empty listing is
+ * ambiguous on its own: a healthy daemon with no containers prints nothing.
  */
 
 export const DOCKER_COMMANDS = {
-  docker: "docker ps --all --no-trunc --format '{{json .}}' 2>&1",
+  docker: "docker ps --all --no-trunc --format '{{json .}}' 2>&1; echo docker-exit:$?",
   /* Local image tags, which is how the run planner knows whether a recipe still
    * has an image to pull. Reads local metadata only - no registry round trip -
    * so it costs about as little as `docker ps`. */
@@ -45,9 +48,14 @@ function readPorts(raw) {
   return [...seen].slice(0, 8);
 }
 
+const EXIT_LINE = /^docker-exit:(\d+)$/m;
+
 export function parseContainers(text) {
-  const trimmed = String(text ?? '').trim();
-  if (!trimmed) return { containers: [], error: null, available: false };
+  const raw = String(text ?? '');
+  const exit = raw.match(EXIT_LINE);
+  const succeeded = exit !== null && exit[1] === '0';
+  const trimmed = raw.replace(EXIT_LINE, '').trim();
+  if (!trimmed) return { containers: [], error: null, available: succeeded };
 
   const containers = [];
   const problems = [];
@@ -84,7 +92,7 @@ export function parseContainers(text) {
     });
   }
 
-  if (containers.length === 0 && problems.length > 0) {
+  if (containers.length === 0 && problems.length > 0 && !succeeded) {
     return { containers: [], error: describeProblem(problems.join(' ')), available: false };
   }
 
