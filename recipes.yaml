@@ -175,21 +175,37 @@
 # In vLLM the same verify pass is k=15: a 16-token block, a power of two, which
 # is the fast path in _grouped_conv. k=16 would verify 17 tokens.
 #
-# NOT YET MEASURED on a Spark. The memory figures are the 0.28 recipe's:
-#   kvBytesPerToken  a property of the architecture and fp8 KV, but 0.29/0.30
-#                    changed hybrid block sizing (#53007, #55450), so the
-#                    startup log's "Setting attention block size" line and pool
-#                    size need re-reading before it is marked measured.
-#   overheadGB       the verify batch grows from 8 to 16 tokens per request,
-#                    which is small next to the 8192-token prefill chunk that
-#                    sets peak activation, but 0.29 also changed CUDA graph
-#                    capture sizes (#50488, #54418). Rounded up by 1 GB until
-#                    a startup log says otherwise.
+# MEASURED on a Spark, 2026-09-27: three boots one after another, each at
+# 65,536 context, one request and --gpu-memory-utilization 0.36, beside a
+# resident SGLang server that sat idle throughout. The same three prompts, 512
+# tokens each at temperature 0 with thinking off, three reps, median tok/s:
+#
+#                     code    edit    chat    mean acceptance length
+#   0.28.0  k=7       42.2    64.4    27.4    4.79
+#   0.30.0  k=7       44.7    61.4    25.9    4.88
+#   0.30.0  k=15      43.6   115.3    27.0    5.55
+#
+# So the version alone is a wash, within about 6% either way. k=15 is what
+# pays, and only where the drafter can see far ahead - edits that restate
+# code already in the prompt run 1.8x faster. Fresh code and prose accept too
+# few tokens per pass for a longer draft to help, and do not lose by it either.
+#
+# The memory figures below come off the k=15 boot's own profile:
+#   overheadGB       29.07 GiB weights + non-torch against a 25.4 GiB model
+#                    load, 4.53 GiB peak activation and 1.46 GiB of CUDA graphs:
+#                    9.66 GiB, so 10.4 GB. 0.28 logged 7.61 GiB for the same.
+#   kvBytesPerToken  10.21 GiB of pool over 156,332 tokens. The attention block
+#                    is 960 tokens here, 880 on 0.28. This was a SMALL pool, and
+#                    the rate falls as the pool grows: 0.28 in the same run gave
+#                    20.12 GiB over 381,285 tokens (56,660 a token), against
+#                    44,827 at 1.9M. So this overstates a large pool, which is
+#                    the safe direction: the surplus shows up as prefix cache,
+#                    not as a server that will not boot.
 - id: qwen38-27b-nvfp4-dflash2-v030
   name: Qwen3.8-27B · NVFP4 + DFlash2 k=15 (vLLM 0.30)
   summary: >-
     The DFlash2 recipe on vLLM 0.30.0 at the draft budget the SGLang recipe
-    runs. Not yet measured on a Spark: run it beside the 0.28 recipe to compare.
+    runs. Measured on a Spark at 115 tok/s on edits, 43.6 on fresh code.
   model:
     repo: RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
     sizeGB: 23.8
@@ -203,11 +219,11 @@
     ref: vllm/vllm-openai:v0.30.0-aarch64
   container: spark-run-qwen38-nvfp4-dflash2-v030
   port: 8000
-  # Carried over from the 0.28 recipe (7.61 GiB measured), plus 1 GB - see above.
-  overheadGB: 9.2
-  # Carried over from the 0.28 recipe; not re-measured on 0.30.
-  kvBytesPerToken: 44827
-  kvMeasured: false
+  # Measured: 3.67 non-torch + 4.53 activation + 1.46 CUDA graphs = 9.66 GiB.
+  overheadGB: 10.4
+  # Measured: 10.21 GiB of pool over 156,332 tokens - see above.
+  kvBytesPerToken: 70127
+  kvMeasured: true
   args:
     --tensor-parallel-size: 1
     --distributed-executor-backend: mp
@@ -227,12 +243,11 @@
     --reasoning-parser: qwen3
   notes:
     - >-
-      Unmeasured. Compare tok/s and the logged mean acceptance length against
-      the 0.28 recipe (45.6 tok/s, 4.70 on code) before switching to it.
+      Wins on edits - 1.8x the 0.28 recipe where the output restates code in
+      the prompt. On fresh code and prose it is level with it.
     - >-
-      Check the startup log for "DFlash2DraftModel", and for which model runner
-      it chose: 0.29 made Model Runner V2 the default but falls back to V1 for
-      some speculative methods.
+      Needs more memory than the 0.28 recipe for the same context: about 3 GB
+      more overhead, and a larger per-token KV cost.
     - >-
       k=15 matches SGLang's budget of 16, which counts the anchor token. Past
       the drafter's trained block of 8, acceptance is the thing to watch.
