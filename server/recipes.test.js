@@ -25,7 +25,7 @@ const roomyNode = (overrides = {}) => ({
   memory: { total: SPARK_MEMORY, used: 4 * GB, available: SPARK_MEMORY - 4 * GB },
   dockerAvailable: true,
   dockerError: null,
-  dockerImages: ['vllm/vllm-openai:v0.28.0-aarch64'],
+  dockerImages: ['vllm/vllm-openai:v0.30.0-aarch64'],
   containers: [],
   storage: [{ mount: '/', available: 2000 * GB }],
   hf: { available: true, user: 'someone', repos: [], cacheDir: '/home/nvidia/.cache/huggingface' },

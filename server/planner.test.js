@@ -138,7 +138,7 @@ test('the script walks the phases in order and only ever exits 0 from ready', ()
  */
 test('the container is launched with a pinned entrypoint and an explicit serve', () => {
   const script = scriptFor(KEPT);
-  assert.match(script, /--entrypoint 'vllm' \\\n {2}'vllm\/vllm-openai:v0\.28\.0-aarch64' 'serve'/);
+  assert.match(script, /--entrypoint 'vllm' \\\n {2}'vllm\/vllm-openai:v0\.30\.0-aarch64' 'serve'/);
 });
 
 test('a drafted recipe fetches both the target and its drafter', () => {
@@ -181,7 +181,7 @@ test('every recipe flag reaches the script individually quoted', () => {
   /* Including the inline JSON, which must survive quoting intact. */
   assert.ok(
     script.includes(
-      `'{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'`,
+      `'{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":15}'`,
     ),
   );
 });
