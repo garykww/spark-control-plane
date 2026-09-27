@@ -52,6 +52,8 @@
 # block size to 880 tokens", so even a short request occupies a 880-token block
 # and the hybrid layer padding wastes up to 25% on top.
 #
+# The recipe now runs 0.30.0, whose own figures are larger - they are with it.
+#
 # ---------------------------------------------------------------------------
 # FIELDS
 #
@@ -108,8 +110,8 @@
 - id: qwen38-27b-nvfp4-dflash2
   name: Qwen3.8-27B · NVFP4 + DFlash2
   summary: >-
-    Lowest single-stream latency. Measured on a Spark at 45.6 tok/s on code with
-    an acceptance length of 4.70.
+    Lowest single-stream latency on vLLM. Measured on a Spark at 115 tok/s on
+    edits and 43.6 on fresh code, with an acceptance length of 5.55.
   model:
     repo: RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
     sizeGB: 23.8
@@ -119,109 +121,15 @@
     sizeGB: 3.8
     measured: true
   image:
-    ref: vllm/vllm-openai:v0.28.0-aarch64
+    # Checked on Docker Hub: an arm64-only tag.
+    ref: vllm/vllm-openai:v0.30.0-aarch64
   container: spark-run-qwen38-nvfp4-dflash2
   port: 8000
-  # Measured: 2.73 non-torch + 3.07 activation + 1.81 CUDA graphs = 7.61 GiB.
-  overheadGB: 8.2
-  # Measured: 80.73 GiB of pool over 1,933,714 tokens, fp8 KV with align mode.
-  kvBytesPerToken: 44827
-  kvMeasured: true
-  args:
-    --tensor-parallel-size: 1
-    --distributed-executor-backend: mp
-    --trust-remote-code: true
-    --enable-prefix-caching: true
-    --enable-chunked-prefill: true
-    --attention-backend: FLASHINFER
-    --mamba-ssm-cache-dtype: bfloat16
-    --mamba-cache-mode: align
-    --max-model-len: 262144
-    --max-num-seqs: 1
-    --max-num-batched-tokens: 8192
-    --kv-cache-dtype: fp8
-    # k caps at 7 on 0.28: the drafter's dflash_config.block_size is 8. 0.30
-    # lifts that - see the recipe below.
-    --speculative-config: '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'
-    --enable-auto-tool-choice: true
-    --tool-call-parser: qwen3_coder
-    --reasoning-parser: qwen3
-  notes:
-    - >-
-      Wins single-stream only. DFlash2 crosses over at concurrency 2, above
-      which 4-bit + MTP is faster.
-    - >-
-      Needs an unquantised lm_head. This export keeps a dense BF16 head, which
-      is why it works where other 4-bit exports are refused.
-    - >-
-      Check the startup log says "DFlash2DraftModel": a DFlash2 checkpoint on a
-      runtime older than 0.27.1 silently drafts as DFlash1.
-
-# ---------------------------------------------------------------------------
-# The recipe above on vLLM 0.30.0 at the SGLang recipe's draft budget. It stays
-# a separate entry so the two can be run back to back on the same box.
-#
-# The draft budget. vLLM 0.30's DFlash2 no longer ties k to the drafter's
-# dflash_config.block_size: qwen3_dflash2.py sizes its local convolution as
-# 1 + num_speculative_tokens ("the bonus token plus the mask tokens"), and
-# config/speculative.py applies no block_size check to method dflash. So the
-# cap of 7 above is gone.
-#
-# k is 15, not 16. SGLang's --speculative-num-draft-tokens counts the anchor:
-# its DFlash worker verifies blocks of that many tokens, with position 0 the
-# current token and gamma = block_size - 1 drafts (pangoleen's
-# dflash_worker_v2.py at 60639a97). Their "budget of 16", measured at 6.8-8.3
-# accepted per pass and 8 -> 16 worth +69% on edits, is therefore 15 drafts.
-# In vLLM the same verify pass is k=15: a 16-token block, a power of two, which
-# is the fast path in _grouped_conv. k=16 would verify 17 tokens.
-#
-# MEASURED on a Spark, 2026-09-27: three boots one after another, each at
-# 65,536 context, one request and --gpu-memory-utilization 0.36, beside a
-# resident SGLang server that sat idle throughout. The same three prompts, 512
-# tokens each at temperature 0 with thinking off, three reps, median tok/s:
-#
-#                     code    edit    chat    mean acceptance length
-#   0.28.0  k=7       42.2    64.4    27.4    4.79
-#   0.30.0  k=7       44.7    61.4    25.9    4.88
-#   0.30.0  k=15      43.6   115.3    27.0    5.55
-#
-# So the version alone is a wash, within about 6% either way. k=15 is what
-# pays, and only where the drafter can see far ahead - edits that restate
-# code already in the prompt run 1.8x faster. Fresh code and prose accept too
-# few tokens per pass for a longer draft to help, and do not lose by it either.
-#
-# The memory figures below come off the k=15 boot's own profile:
-#   overheadGB       29.07 GiB weights + non-torch against a 25.4 GiB model
-#                    load, 4.53 GiB peak activation and 1.46 GiB of CUDA graphs:
-#                    9.66 GiB, so 10.4 GB. 0.28 logged 7.61 GiB for the same.
-#   kvBytesPerToken  10.21 GiB of pool over 156,332 tokens. The attention block
-#                    is 960 tokens here, 880 on 0.28. This was a SMALL pool, and
-#                    the rate falls as the pool grows: 0.28 in the same run gave
-#                    20.12 GiB over 381,285 tokens (56,660 a token), against
-#                    44,827 at 1.9M. So this overstates a large pool, which is
-#                    the safe direction: the surplus shows up as prefix cache,
-#                    not as a server that will not boot.
-- id: qwen38-27b-nvfp4-dflash2-v030
-  name: Qwen3.8-27B · NVFP4 + DFlash2 k=15 (vLLM 0.30)
-  summary: >-
-    The DFlash2 recipe on vLLM 0.30.0 at the draft budget the SGLang recipe
-    runs. Measured on a Spark at 115 tok/s on edits, 43.6 on fresh code.
-  model:
-    repo: RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
-    sizeGB: 23.8
-    measured: true
-  draft:
-    repo: incoai/Qwen3.8-27B-DFlash2
-    sizeGB: 3.8
-    measured: true
-  image:
-    # Checked on Docker Hub: an arm64-only tag, like the 0.28 one above.
-    ref: vllm/vllm-openai:v0.30.0-aarch64
-  container: spark-run-qwen38-nvfp4-dflash2-v030
-  port: 8000
-  # Measured: 3.67 non-torch + 4.53 activation + 1.46 CUDA graphs = 9.66 GiB.
+  # Measured on 0.30: 3.67 non-torch + 4.53 activation + 1.46 CUDA graphs =
+  # 9.66 GiB. See the note below the recipe.
   overheadGB: 10.4
-  # Measured: 10.21 GiB of pool over 156,332 tokens - see above.
+  # Measured on 0.30: 10.21 GiB of pool over 156,332 tokens, fp8 KV with align
+  # mode. See the note below the recipe.
   kvBytesPerToken: 70127
   kvMeasured: true
   args:
@@ -237,20 +145,69 @@
     --max-num-seqs: 1
     --max-num-batched-tokens: 8192
     --kv-cache-dtype: fp8
+    # k=15 - see the note below the recipe for why not 7, and why not 16.
     --speculative-config: '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":15}'
     --enable-auto-tool-choice: true
     --tool-call-parser: qwen3_coder
     --reasoning-parser: qwen3
   notes:
     - >-
-      Wins on edits - 1.8x the 0.28 recipe where the output restates code in
-      the prompt. On fresh code and prose it is level with it.
+      Wins single-stream only. DFlash2 crosses over at concurrency 2, above
+      which 4-bit + MTP is faster.
     - >-
-      Needs more memory than the 0.28 recipe for the same context: about 3 GB
-      more overhead, and a larger per-token KV cost.
+      Fastest on edits, where the output restates code in the prompt: 1.8x what
+      k=7 managed. On fresh code and prose it is level with k=7.
     - >-
-      k=15 matches SGLang's budget of 16, which counts the anchor token. Past
-      the drafter's trained block of 8, acceptance is the thing to watch.
+      Needs an unquantised lm_head. This export keeps a dense BF16 head, which
+      is why it works where other 4-bit exports are refused.
+    - >-
+      Check the startup log says "DFlash2DraftModel": a DFlash2 checkpoint on a
+      runtime older than 0.27.1 silently drafts as DFlash1.
+
+# ---------------------------------------------------------------------------
+# vLLM 0.30.0 and k=15, measured against the 0.28 recipe this replaced.
+#
+# The draft budget. On 0.28 this recipe ran k=7, capped by the drafter's
+# dflash_config.block_size of 8. vLLM 0.30's DFlash2 no longer ties k to it:
+# qwen3_dflash2.py sizes its local convolution as 1 + num_speculative_tokens
+# ("the bonus token plus the mask tokens"), and config/speculative.py applies
+# no block_size check to method dflash.
+#
+# k is 15, not 16. SGLang's --speculative-num-draft-tokens counts the anchor:
+# its DFlash worker verifies blocks of that many tokens, with position 0 the
+# current token and gamma = block_size - 1 drafts (pangoleen's
+# dflash_worker_v2.py at 60639a97). Their "budget of 16", measured at 6.8-8.3
+# accepted per pass and 8 -> 16 worth +69% on edits, is therefore 15 drafts.
+# In vLLM the same verify pass is k=15: a 16-token block, a power of two, which
+# is the fast path in _grouped_conv. k=16 would verify 17 tokens.
+#
+# MEASURED on a Spark, 2026-09-27: three boots one after another, each at
+# 65,536 context, one request and --gpu-memory-utilization 0.36, beside a
+# resident SGLang server that sat idle throughout. The same three prompts, 512
+# tokens each at temperature 0 with thinking off, three reps, median tok/s:
+#
+#                     code    edit    chat    mean acceptance length
+#   0.28.0  k=7       42.2    64.4    27.4    4.79    (the previous recipe)
+#   0.30.0  k=7       44.7    61.4    25.9    4.88
+#   0.30.0  k=15      43.6   115.3    27.0    5.55
+#
+# So the version alone is a wash, within about 6% either way. k=15 is what
+# pays, and only where the drafter can see far ahead - edits that restate
+# code already in the prompt run 1.8x faster. Fresh code and prose accept too
+# few tokens per pass for a longer draft to help, and do not lose by it either.
+#
+# The memory figures above come off the k=15 boot's own profile, and replace
+# the 0.28 ones in the header (8.2 GB and 44,827 bytes a token):
+#   overheadGB       29.07 GiB weights + non-torch against a 25.4 GiB model
+#                    load, 4.53 GiB peak activation and 1.46 GiB of CUDA graphs:
+#                    9.66 GiB, so 10.4 GB. 0.28 logged 7.61 GiB for the same.
+#   kvBytesPerToken  10.21 GiB of pool over 156,332 tokens. The attention block
+#                    is 960 tokens here, 880 on 0.28. This was a SMALL pool, and
+#                    the rate falls as the pool grows: 0.28 in the same run gave
+#                    20.12 GiB over 381,285 tokens (56,660 a token), against
+#                    44,827 at 1.9M. So this overstates a large pool, which is
+#                    the safe direction: the surplus shows up as prefix cache,
+#                    not as a server that will not boot.
 
 # ---------------------------------------------------------------------------
 # Ported from serve-qwen36-35b-a3b-dflash.sh.
@@ -1467,10 +1424,10 @@
 # Ported from github.com/pangoleen/qwen3.8-27b-dgx-spark-dflash2 (MIT), the
 # SGLang recipe @redp314 measured on a Spark over the weekend of 2026-09-02.
 # It serves the SAME model as the first recipe in this file on a DIFFERENT
-# engine, and that is the whole point of it: the vLLM recipe above gets 45.6
-# tok/s single-stream on code, this one is published at 64-78 to 65k of
-# context, because SGLang takes the drafter at a budget of 16 where vLLM's
-# DFlash2 path caps at 7.
+# engine, and that is the whole point of it: the vLLM recipe above gets 43.6
+# tok/s single-stream on fresh code, this one is published at 64-78 to 65k of
+# context. Both now verify 16 tokens a pass (vLLM's k=15 is SGLang's budget of
+# 16); when this was ported, vLLM 0.28 capped the drafter at 7.
 #
 # WHAT CARRIED OVER VERIFIED, on nv-spark-01, 2026-09-17:
 #
@@ -1544,7 +1501,7 @@
   name: Qwen3.8-27B · SGLang + DFlash2
   summary: >-
     The same weights as the vLLM recipe on SGLang, which takes the drafter at a
-    budget of 16 rather than 7. Published at 64-78 tok/s on code to 65k.
+    budget of 16. Published at 64-78 tok/s on code to 65k.
   model:
     # Measured: `du -sb` on this node's cache, 2026-09-17. Their README says
     # 21 GB; this is the export's real on-disk size.
@@ -1671,8 +1628,8 @@
     --speculative-draft-model-path: maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal
     --speculative-draft-model-quantization: modelopt_fp4
     --speculative-draft-attention-backend: flashinfer
-    # 16, not the 8 the DFlash2 blog uses and not the 7 the vLLM recipe is
-    # capped at. The drafter's block_size of 8 is not a cap on the verify
+    # 16, not the 8 the DFlash2 blog uses and not the 7 vLLM 0.28 capped the
+    # drafter at. The drafter's block_size of 8 is not a cap on the verify
     # budget: they measured 8 -> 16 as +69.3% on edit-heavy work and +10.5% on
     # fresh code, and 24 as past the knee on both.
     --speculative-num-draft-tokens: 16
