@@ -33,6 +33,8 @@ You don't need to install an agent on the monitored machines. The server runs or
 
 ## Install
 
+For a stable install or clone, pin to release tag [`v0.1.0`](https://github.com/garykww/spark-control-plane/releases/tag/v0.1.0) (e.g. `SPARK_BRANCH=v0.1.0` with the installer, or `git clone --branch v0.1.0`).
+
 One command, on the machine you want the dashboard to run on:
 
 ```bash
