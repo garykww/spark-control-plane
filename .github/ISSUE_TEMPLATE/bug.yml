@@ -1,0 +1,55 @@
+name: Bug report
+description: Something isn't working as expected
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong, in one or two sentences.
+      placeholder: e.g. Node detail page shows dashes for GPU util after a recipe run finishes.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro steps
+      description: Exact steps to reproduce the problem.
+      placeholder: |
+        1. …
+        2. …
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected_vs_actual
+    attributes:
+      label: Expected vs actual
+      description: What you expected, and what actually happened.
+      placeholder: |
+        Expected: …
+        Actual: …
+    validations:
+      required: true
+  - type: textarea
+    id: spark_node_context
+    attributes:
+      label: Spark / node context
+      description: Hardware and environment that matter (node kind, OS, driver, dashboard version, how you run it).
+      placeholder: |
+        Node: DGX Spark / other Linux + NVIDIA
+        OS / kernel:
+        nvidia-smi / driver:
+        Dashboard version / commit:
+        Run via: install.sh / docker / npm run dev
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant dashboard, container, or system logs (redact secrets).
+      render: shell
+    validations:
+      required: false
