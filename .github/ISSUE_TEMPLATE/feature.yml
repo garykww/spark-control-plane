@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a change or new capability
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem or gap are you trying to solve?
+      placeholder: e.g. There's no way to tell which recipe is already running on a node from the fleet view.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_outcome
+    attributes:
+      label: Proposed outcome
+      description: What should be true when this is done?
+      placeholder: e.g. Fleet cards show the active recipe name (or "idle") without opening the node.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance criteria
+      description: Concrete checks that would mark this done.
+      placeholder: |
+        - [ ] …
+        - [ ] …
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What this should explicitly not include.
+      placeholder: |
+        - …
+    validations:
+      required: false

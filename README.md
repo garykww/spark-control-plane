@@ -474,6 +474,13 @@ src/
 
 **Fields the driver doesn't report stay blank.** A dash means "not reported", never zero. Fan speed on a passively cooled GB10 is a real example.
 
+## Contributing
+
+Bug reports and feature ideas are welcome. Open an issue with the matching template:
+
+- [Bug report](https://github.com/garykww/spark-control-plane/issues/new?template=bug.yml) — summary, repro, expected vs actual, Spark/node context, logs
+- [Feature request](https://github.com/garykww/spark-control-plane/issues/new?template=feature.yml) — problem, proposed outcome, acceptance criteria, non-goals
+
 ## Credit
 
 Inspired by [sparkDash](https://github.com/MiaAI-Lab/sparkDash), which covers similar ground for the same hardware.
