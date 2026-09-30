@@ -295,7 +295,7 @@ The node detail page lists a set of **recipes** — whole serving configurations
 
 ![picking a recipe and pricing it against the node's free memory](docs/model-runs.png)
 
-The catalogue ships eight, across three runtimes — `vllm`, `sglang` and `service`:
+The catalogue ships nine, across three runtimes — `vllm`, `sglang` and `service`:
 
 | Recipe | From | Figures |
 | --- | --- | --- |
@@ -304,6 +304,7 @@ The catalogue ships eight, across three runtimes — `vllm`, `sglang` and `servi
 | **Qwen3.6-35B-A3B · NVFP4 + DFlash** | `serve-qwen36-35b-a3b-dflash.sh` | Weights measured on the node, KV derived from its `config.json`; the overhead figure is an estimate, and the panel labels it |
 | **DiffusionGemma-26B-A4B · NVFP4** | `serve-diffusiongemma-26b-a4b.sh` | Measured, off a real startup log for this model on the node |
 | **ComfyUI · MiniMax H3**, and a SageAttention variant | `run-comfyui-h3-spark.sh` | Measured on a GB10; `service` recipes, so no KV cache and nothing to tune |
+| **ComfyUI · Qwen-Image-2.1** | [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) | Measured on a GB10; builds its image on the H3 one with a newer ComfyUI |
 | **Qwen3-ASR-1.7B · BF16** | [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) | Weights measured off the Hub, KV derived from `config.json`, overhead estimated; builds its image |
 | **GLM-ASR-Nano-2512 · BF16** | the model card | Weights measured off the Hub, KV derived from `config.json` |
 
