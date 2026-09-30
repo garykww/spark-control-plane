@@ -991,6 +991,184 @@
 
 # ---------------------------------------------------------------------------
 # NOT a port of a launcher script - this one is new, from
+# https://huggingface.co/Comfy-Org/Qwen-Image-2.1, ComfyUI's repack of
+# Qwen/Qwen-Image-2.1 (released 2026-09-20).
+#
+# One 7B MMDiT covers text-to-image, instruction editing of up to four input
+# images, and RGBA output with a real alpha channel, natively at 2K. A Qwen3-VL-8B
+# is the text encoder; a separate Qwen3.5-9B "prompt enhancer" (one for t2i, one
+# for i2i) rewrites the prompt through ComfyUI's TextGenerate node first.
+#
+# LICENCE. The Qwen Research License Agreement: NON-COMMERCIAL use only
+# ("research or evaluation purposes"). Commercial use needs a separate licence
+# from Qwen. Not Apache-2.0 like the rest of the Qwen models here.
+#
+# WHY COMFYUI AND NOT VLLM. vLLM-Omni serves this model with an OpenAI-style
+# /v1/images/generations, but as of 2026-09-30 its support is an unmerged PR
+# (vllm-project/vllm-omni#7759), absent from v0.30.0 and the nightly image.
+# Once a vllm-omni image ships it, that becomes a plain pull and is worth adding
+# as its own `service` recipe - not a `vllm` one, since a diffusion pipeline has
+# no KV cache for the planner to size.
+#
+# THE IMAGE HAS TO BE NEWER than the MiniMax H3 ones above. Both H3 images were
+# built on ComfyUI v0.33.1 (the published image's COMFYUI_REF build arg), and
+# ComfyUI loads Qwen-Image-2.1 from v0.37.0 (2026-09-21); v0.38.0 adds a KV
+# cache placement fix and block compilation for it. Rather than a third
+# out-of-band Dockerfile build, this derives from the published sm121-sage image
+# - which already carries the sm_121 torch, torchaudio and the rest - and moves
+# its ComfyUI checkout forward. The image is a shallow --branch clone, so the tag
+# is fetched explicitly before it can be checked out.
+#
+# The requirements step does NOT touch torch: v0.38.0 lists torch and
+# torchvision unpinned, which the image's NVIDIA builds already satisfy, and the
+# NGC base's PIP_CONSTRAINT pins them besides. What it does move are ComfyUI's
+# own pins - frontend, workflow templates, comfy-kitchen, comfy-aimdo, av>=17.
+#
+# SageAttention is installed in that base but deliberately NOT switched on: see
+# comfyui-minimax-h3-sage for why it stays opt-in, and nobody has checked it
+# against this model.
+
+- id: comfyui-qwen-image-2-1
+  runtime: service
+  name: ComfyUI · Qwen-Image-2.1
+  summary: >-
+    Text-to-image, multi-image editing and transparent RGBA output at up to 2K,
+    from one 7B model. ComfyUI's own web UI rather than an API endpoint.
+  image:
+    # Built on the node, not published. Named for the ComfyUI it carries.
+    ref: comfyui-qwen-image-2.1:v0.38.0-sm121
+    build:
+      from: garykww/comfyui-minimax-h3:sm121-sage
+      run:
+        - git -C /workspace/ComfyUI fetch --depth 1 origin tag v0.38.0
+        - git -C /workspace/ComfyUI checkout v0.38.0
+        - pip install --no-cache-dir -r /workspace/ComfyUI/requirements.txt
+  # Distinct from the H3 recipes' containers and host port, so this one can be
+  # started without first stopping theirs - memory permitting, which with H3's
+  # 100 GB it does not.
+  container: comfyui-qwen-image-21
+  port: 8189
+  containerPort: 8188
+  ipcHost: true
+  # MEASURED on a GB10, 2026-09-30, with another model already loaded beside
+  # it. The official workflows (t2i, edit, background removal) all
+  # load the same int8 set:
+  #
+  #    7.26 GB  qwen_image_2.1_int8_convrot           diffusion model
+  #    9.35 GB  qwen3vl_8b_int8_convrot               text encoder
+  #    9.47 GB  qwen3.5_9b ..._pe_t2i (or _pe_i2i)    prompt enhancer
+  #    0.68 GB  qwen_image_2.1_vae_bf16
+  #   26.76 GB  of weight files
+  #
+  # though the templates ship with the enhancer SWITCHED OFF, so by default the
+  # 9.47 GB enhancer is never loaded. Three t2i runs, 25 steps, euler/simple:
+  #
+  #   1024x1024, enhancer off   28 s
+  #   1024x1024, enhancer on    28 s    24.8 GiB device peak
+  #   2048x2048, enhancer on   122 s    31.6 GiB device peak (33.9 GB)
+  #
+  # At 2K the container also held ~2.5 GB of host anonymous memory; its cgroup
+  # peak of 13.7 GB is mostly page cache from the mmapped safetensors, which
+  # the kernel reclaims, so it does not add. Node-wide MemAvailable agreed: it
+  # fell by ~33 GB over the 2K run. So ~37 GB for the heaviest case measured,
+  # rounded up to 38.
+  #
+  # Unlike H3, there is no 1.55x unified-memory penalty on top of the weights
+  # here: nvidia-smi's figure is the whole working set, not a second copy.
+  # Edits carrying several reference images lengthen the sequence and were
+  # not measured.
+  #
+  # QUALITY AT 2K IS AN OPEN QUESTION. Both 1024x1024 images were clean; the
+  # 2048x2048 one showed visible banding in the fog - smooth gradients broken
+  # into flat patches. Not yet isolated: the int8 diffusion model and the
+  # QwenImage21Cache node (run at device auto) are the two suspects, and
+  # re-running with the cache off and on the BF16 model would separate them.
+  memoryGB: 38
+  memoryMeasured: true
+  # --disable-pinned-memory for the reason given on comfyui-minimax-h3: ComfyUI
+  # budgets pinned memory against RAM plus swap, which on unified memory is the
+  # same pool the model lives in. Cheap insurance here; that recipe is where it
+  # was needed.
+  command:
+    - --listen
+    - 0.0.0.0
+    - --port
+    - "8188"
+    - --disable-pinned-memory
+  readiness:
+    path: /system_stats
+    auth: none
+  # The same host directories as the H3 recipes, so inputs, outputs, saved
+  # workflows and hand-dropped LoRAs are shared across every ComfyUI recipe.
+  volumes:
+    - host: ~/Workspace/comfyui/input
+      container: /workspace/ComfyUI/input
+    - host: ~/Workspace/comfyui/output
+      container: /workspace/ComfyUI/output
+    - host: ~/Workspace/comfyui/workflows
+      container: /workspace/ComfyUI/user/default/workflows
+    - host: ~/Workspace/comfyui/models/loras
+      container: /workspace/ComfyUI/models/loras
+  weights:
+    # Named files, not the repo: it also holds BF16 copies of the diffusion
+    # model (14.2 GB), text encoder (17.5 GB) and ControlNet (7.6 GB) that the
+    # official workflows do not use - 85.6 GB for the lot. Sizes are the Hub's
+    # own byte counts for revision cb504a40, 2026-09-30.
+    #
+    # Mounting is not loading: the i2i enhancer, the w4a8 text encoder and the
+    # ControlNet cost disk only until a workflow selects them.
+    - repo: Comfy-Org/Qwen-Image-2.1
+      sizeGB: 46.3
+      measured: true
+      mountBase: /workspace/ComfyUI/models
+      files:
+        # The set the official workflows load, and what memoryGB describes.
+        - diffusion_models/qwen_image_2.1_int8_convrot.safetensors
+        - text_encoders/qwen3vl_8b_int8_convrot.safetensors
+        - text_encoders/qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors
+        - vae/qwen_image_2.1_vae_bf16.safetensors
+        # The edit workflow's enhancer, in place of the t2i one above.
+        - text_encoders/qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors
+        # 6.3 GB against the 9.4 above; a different quantisation method, so an
+        # alternative to compare rather than a drop-in.
+        - text_encoders/qwen3vl_8b_w4a8.safetensors
+        # Union ControlNet (canny, depth, pose and the like), as a model patch.
+        - model_patches/qwen_image_2.1_fun_controlnet_union_int8_convrot.safetensors
+  notes:
+    - >-
+      Qwen Research License: non-commercial use only. Using the model or its
+      output commercially needs a separate licence from Qwen.
+    - >-
+      Opens ComfyUI's own web UI on port 8189, not an API endpoint. It has no
+      authentication, so treat the port as open to whoever can reach it.
+    - >-
+      The first run builds its image: the published MiniMax H3 SageAttention
+      image with ComfyUI moved from v0.33.1 to v0.38.0, since the older one
+      cannot load this model. That pulls the base image if the node lacks it.
+    - >-
+      Load the workflows from ComfyUI's template browser (Qwen Image 2.1: Text
+      to Image, Image Edit, Remove Background); every file they name is
+      mounted. Inputs, outputs, workflows and LoRAs share ~/Workspace/comfyui
+      with the MiniMax H3 recipes.
+    - >-
+      Measured at 38 GB for a 2048x2048 image with the prompt enhancer on
+      (122 s for 25 steps); 1024x1024 takes 28 s. The templates ship with the
+      enhancer off - switch it on in the subgraph to use it. Multi-image edits
+      were not measured.
+    - >-
+      A 2048x2048 test image showed banding in smooth gradients that 1024x1024
+      did not. Cause not yet isolated; check 2K output before relying on it.
+    - >-
+      For a transparent PNG, start the prompt "This is an RGBA image with
+      transparency." and end it "The image has alpha channel and the
+      background is transparent."
+    - >-
+      Its weights are ordinary HuggingFace cache entries, so the cache panel
+      lists and can delete them. Deleting the repo there removes the files a
+      running container is reading.
+
+# ---------------------------------------------------------------------------
+# NOT a port of a launcher script - this one is new, from
 # https://github.com/QwenLM/Qwen3-ASR (Apache-2.0, weights included).
 #
 # A TRANSCRIPTION server rather than a chat one. Qwen3-ASR is a 24-layer audio
